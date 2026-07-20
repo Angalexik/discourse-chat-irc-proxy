@@ -12,7 +12,9 @@ use irc::proto::{
     IrcCodec, Message, Response,
 };
 use pin_project::pin_project;
-use reqwest::{Client, IntoUrl, Proxy, Url, header::HeaderMap};
+#[allow(unused_imports)]
+use reqwest::Proxy;
+use reqwest::{Client, IntoUrl, Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use std::pin::pin;
 use std::{
