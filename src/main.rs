@@ -1,5 +1,4 @@
 use color_eyre::eyre::{Context as _, OptionExt, Result, eyre};
-use either::Either;
 use futures::{
     FutureExt, Sink, Stream, StreamExt,
     future::LocalBoxFuture,
@@ -10,6 +9,7 @@ use futures::{
 use irc::proto::{
     Command::{self},
     IrcCodec, Message, Response,
+    error::ProtocolError,
 };
 use pin_project::pin_project;
 #[allow(unused_imports)]
@@ -23,7 +23,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 use time::{UtcDateTime, format_description::well_known::Iso8601};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_util::io::StreamReader;
 use tokio_util::{
     bytes::Bytes,
@@ -342,6 +342,7 @@ fn create_response(response: Response, client: String, arguments: Vec<String>) -
     }
 }
 
+#[derive(Clone)]
 struct ChatClient {
     client: Client,
     headers: HeaderMap,
@@ -486,25 +487,40 @@ fn deserialize_messagebus_chat_message(data: serde_json::Value) -> Result<ChatMe
     }
 }
 
-struct Connection {
-    connected: bool,
-    nick: String,
+enum Event {
+    Irc(Message),
+    MessageBus(MessageBusMessage),
 }
 
-impl Connection {
-    fn new() -> Self {
-        Self {
+struct Connection<Si, St> {
+    connected: bool,
+    nick: String,
+    irc_sink: Si,
+    event_stream: St,
+    chat_client: ChatClient,
+    // TODO: Replace with HashSet and remove old values to prevent memory leak
+    ignore_message_ids: Vec<i64>,
+}
+
+impl<Si, St> Connection<Si, St>
+where
+    Si: Sink<Message> + Unpin,
+    Si::Error: core::error::Error + Sync + Send + 'static,
+    St: Stream<Item = Result<Event>> + Unpin,
+{
+    async fn new(irc_sink: Si, event_stream: St, chat_client: ChatClient) -> Result<Self> {
+        Ok(Self {
             connected: false,
             nick: "".to_string(),
-        }
+            irc_sink,
+            event_stream,
+            chat_client,
+            ignore_message_ids: Vec::new(),
+        })
     }
 
-    async fn greet_client<S>(&self, irc_sink: &mut S, chat_client: &ChatClient) -> Result<()>
-    where
-        S: Sink<Message> + Unpin,
-        S::Error: core::error::Error + Sync + Send + 'static,
-    {
-        irc_sink
+    async fn greet_client(&mut self) -> Result<()> {
+        self.irc_sink
             .feed(Message {
                 tags: None,
                 prefix: None,
@@ -515,7 +531,7 @@ impl Connection {
             })
             .await?;
 
-        irc_sink
+        self.irc_sink
             .feed(Message {
                 tags: None,
                 prefix: None,
@@ -529,7 +545,7 @@ impl Connection {
             })
             .await?;
 
-        irc_sink
+        self.irc_sink
             .feed(Message::new(
                 Some(&self.nick),
                 "JOIN",
@@ -537,33 +553,23 @@ impl Connection {
             )?)
             .await?;
 
-        self.send_names(irc_sink, chat_client, "#blanket-fort".to_string())
-            .await?;
+        self.send_names("#blanket-fort".to_string()).await?;
 
-        let backlog = chat_client.message_backlog().await?;
+        let backlog = self.chat_client.message_backlog().await?;
 
         for message in backlog.iter().flat_map(|message| message.to_irc()) {
-            irc_sink.feed(message?).await?;
+            self.irc_sink.feed(message?).await?;
         }
 
         Ok(())
     }
 
-    async fn send_names<S>(
-        &self,
-        irc_sink: &mut S,
-        chat_client: &ChatClient,
-        channel: String,
-    ) -> Result<()>
-    where
-        S: Sink<Message> + Unpin,
-        S::Error: core::error::Error + Sync + Send + 'static,
-    {
-        if channel == "#blanket-fort" {
-            let users = chat_client.list_users().await?;
+    async fn send_names(&mut self, channel: String) -> Result<()> {
+        if channel.eq_ignore_ascii_case("#blanket-fort") {
+            let users = self.chat_client.list_users().await?;
             let arguments = vec!["=".to_string(), channel.clone()];
 
-            irc_sink
+            self.irc_sink
                 .feed(create_response(
                     Response::RPL_NAMREPLY,
                     self.nick.clone(),
@@ -571,7 +577,7 @@ impl Connection {
                 ))
                 .await?;
 
-            irc_sink
+            self.irc_sink
                 .feed(create_response(
                     Response::RPL_ENDOFNAMES,
                     self.nick.clone(),
@@ -579,7 +585,7 @@ impl Connection {
                 ))
                 .await?;
         } else {
-            irc_sink
+            self.irc_sink
                 .feed(create_response(
                     Response::ERR_NOSUCHCHANNEL,
                     self.nick.clone(),
@@ -591,195 +597,199 @@ impl Connection {
         Ok(())
     }
 
-    async fn handle(&mut self, socket: TcpStream) -> Result<()> {
-        let (mut irc_sink, irc_stream) = IrcCodec::new("UTF-8")?.framed(socket).split();
-        let irc_stream = irc_stream.map(Either::Right);
-        let chat_client = ChatClient::new(
-            "https://a-lilian-garden.discourse.group",
-            "angalexik",
-            "Straight-up just my literal password stored in plaintext",
-        )
-        .await?;
+    async fn handle_irc(&mut self, irc_message: Message) -> Result<bool> {
+        match irc_message.command {
+            Command::PING(x, y) => {
+                self.irc_sink
+                    .feed(Message {
+                        tags: None,
+                        prefix: None,
+                        command: Command::PONG(x, y),
+                    })
+                    .await?
+            }
+            Command::NICK(_) => {
+                self.nick = "angalexik".to_string();
 
-        // TODO: Replace with HashSet and remove old values to prevent memory leak
-        let mut ignore_message_ids = Vec::new();
-        let message_bus = MessageBus::new(
-            chat_client.client.clone(),
-            chat_client.headers.clone(),
-            chat_client.base_url.clone(),
-            &["/chat/4"],
-        )
-        .map(Either::Left);
+                if !self.connected {
+                    self.connected = true;
 
-        let mut ultimate_stream = tokio_stream::StreamExt::merge(irc_stream, message_bus);
-        while let Some(item) = ultimate_stream.next().await {
-            match item {
-                Either::Right(irc_message) => {
-                    match dbg!(irc_message?).command {
-                        Command::PING(x, y) => {
-                            irc_sink
-                                .feed(Message {
-                                    tags: None,
-                                    prefix: None,
-                                    command: Command::PONG(x, y),
-                                })
-                                .await?
-                        }
-                        Command::NICK(_) => {
-                            self.nick = "angalexik".to_string();
-
-                            if !self.connected {
-                                self.connected = true;
-
-                                self.greet_client(&mut irc_sink, &chat_client).await?;
-                                irc_sink.flush().await?;
-                            }
-                        }
-                        Command::PRIVMSG(target, text) => {
-                            if target == "#blanket-fort" {
-                                let message_id = chat_client.send_message(&text).await?;
-                                ignore_message_ids.push(dbg!(message_id));
-                            } else {
-                                irc_sink
-                                    .feed(Message {
-                                        tags: None,
-                                        prefix: None,
-                                        command: Command::Response(
-                                            Response::ERR_NOSUCHNICK,
-                                            vec![
-                                                self.nick.clone(),
-                                                target,
-                                                "No such nick/channel".to_string(),
-                                            ],
-                                        ),
-                                    })
-                                    .await?;
-                            }
-                        }
-                        Command::JOIN(channel, _, _) => {
-                            if channel == "#blanket-fort" {
-                                irc_sink
-                                    .feed(Message::new(
-                                        Some(&self.nick),
-                                        "JOIN",
-                                        vec!["#blanket-fort"],
-                                    )?)
-                                    .await?;
-                            } else {
-                                irc_sink
-                                    .feed(Message {
-                                        tags: None,
-                                        prefix: None,
-                                        command: Command::Response(
-                                            Response::ERR_NOSUCHCHANNEL,
-                                            vec![
-                                                self.nick.clone(),
-                                                channel,
-                                                "No such channel".to_string(),
-                                            ],
-                                        ),
-                                    })
-                                    .await?;
-                            }
-                        }
-                        Command::WHO(None, _) => {
-                            irc_sink
-                                .feed(create_response(
-                                    Response::ERR_NEEDMOREPARAMS,
-                                    self.nick.clone(),
-                                    vec!["WHO".to_string(), "Not enough parameters".to_string()],
-                                ))
-                                .await?;
-                        }
-                        Command::WHO(Some(mask), _) => {
-                            if mask.eq_ignore_ascii_case(&self.nick)
-                                || mask.eq_ignore_ascii_case("#blanket-fort")
-                            {
-                                irc_sink
-                                    .feed(create_response(
-                                        Response::RPL_WHOREPLY,
-                                        self.nick.clone(),
-                                        vec![
-                                            "#blanket-fort".to_string(),
-                                            self.nick.clone(),
-                                            self.nick.clone(),
-                                            "localhost".to_string(),
-                                            self.nick.clone(),
-                                            "H".to_string(),
-                                            0.to_string(),
-                                            self.nick.clone(),
-                                        ],
-                                    ))
-                                    .await?;
-                                irc_sink
-                                    .feed(create_response(
-                                        Response::RPL_ENDOFWHO,
-                                        self.nick.clone(),
-                                        vec![mask, "End of WHO list".to_string()],
-                                    ))
-                                    .await?;
-                            } else {
-                                irc_sink
-                                    .feed(create_response(
-                                        Response::ERR_NOSUCHNICK,
-                                        self.nick.clone(),
-                                        vec![mask, "No such nick/channel".to_string()],
-                                    ))
-                                    .await?;
-                            }
-                        }
-                        Command::NAMES(None, _) => {
-                            irc_sink
-                                .feed(create_response(
-                                    Response::ERR_NEEDMOREPARAMS,
-                                    self.nick.clone(),
-                                    vec!["NAMES".to_string(), "Not enough parameters".to_string()],
-                                ))
-                                .await?;
-                        }
-                        Command::NAMES(Some(channel), _) => {
-                            self.send_names(&mut irc_sink, &chat_client, channel)
-                                .await?;
-                        }
-                        Command::QUIT(_) => break,
-                        Command::USER(_, _, _) => (),
-                        other => {
-                            irc_sink
-                                .feed(create_response(
-                                    Response::ERR_UNKNOWNCOMMAND,
-                                    self.nick.clone(),
-                                    vec![other.variant_name(), "Unknown command".to_string()],
-                                ))
-                                .await?;
-                            eprintln!("Unknown method: {other:#?}")
-                        }
-                    }
-
-                    irc_sink.flush().await?;
+                    self.greet_client().await?;
+                    self.irc_sink.flush().await?;
                 }
-                Either::Left(message_bus_message) => {
-                    let message = message_bus_message?;
-                    if message.channel == "/chat/4" {
-                        let content = deserialize_messagebus_chat_message(message.data);
-                        match content {
-                            Ok(content) => {
-                                if !ignore_message_ids.contains(&content.id) {
-                                    for message in content.to_irc() {
-                                        irc_sink.send(message?).await?;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = dbg!(e);
-                            }
+            }
+            Command::PRIVMSG(target, text) => {
+                if target == "#blanket-fort" {
+                    let message_id = self.chat_client.send_message(&text).await?;
+                    self.ignore_message_ids.push(dbg!(message_id));
+                } else {
+                    self.irc_sink
+                        .feed(Message {
+                            tags: None,
+                            prefix: None,
+                            command: Command::Response(
+                                Response::ERR_NOSUCHNICK,
+                                vec![
+                                    self.nick.clone(),
+                                    target,
+                                    "No such nick/channel".to_string(),
+                                ],
+                            ),
+                        })
+                        .await?;
+                }
+            }
+            Command::JOIN(channel, _, _) => {
+                if channel == "#blanket-fort" {
+                    self.irc_sink
+                        .feed(Message::new(
+                            Some(&self.nick),
+                            "JOIN",
+                            vec!["#blanket-fort"],
+                        )?)
+                        .await?;
+                } else {
+                    self.irc_sink
+                        .feed(Message {
+                            tags: None,
+                            prefix: None,
+                            command: Command::Response(
+                                Response::ERR_NOSUCHCHANNEL,
+                                vec![self.nick.clone(), channel, "No such channel".to_string()],
+                            ),
+                        })
+                        .await?;
+                }
+            }
+            Command::WHO(None, _) => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::ERR_NEEDMOREPARAMS,
+                        self.nick.clone(),
+                        vec!["WHO".to_string(), "Not enough parameters".to_string()],
+                    ))
+                    .await?;
+            }
+            Command::WHO(Some(mask), _) => {
+                if mask.eq_ignore_ascii_case(&self.nick)
+                    || mask.eq_ignore_ascii_case("#blanket-fort")
+                {
+                    self.irc_sink
+                        .feed(create_response(
+                            Response::RPL_WHOREPLY,
+                            self.nick.clone(),
+                            vec![
+                                "#blanket-fort".to_string(),
+                                self.nick.clone(),
+                                self.nick.clone(),
+                                "localhost".to_string(),
+                                self.nick.clone(),
+                                "H".to_string(),
+                                0.to_string(),
+                                self.nick.clone(),
+                            ],
+                        ))
+                        .await?;
+                    self.irc_sink
+                        .feed(create_response(
+                            Response::RPL_ENDOFWHO,
+                            self.nick.clone(),
+                            vec![mask, "End of WHO list".to_string()],
+                        ))
+                        .await?;
+                } else {
+                    self.irc_sink
+                        .feed(create_response(
+                            Response::ERR_NOSUCHNICK,
+                            self.nick.clone(),
+                            vec![mask, "No such nick/channel".to_string()],
+                        ))
+                        .await?;
+                }
+            }
+            Command::NAMES(None, _) => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::ERR_NEEDMOREPARAMS,
+                        self.nick.clone(),
+                        vec!["NAMES".to_string(), "Not enough parameters".to_string()],
+                    ))
+                    .await?;
+            }
+            Command::NAMES(Some(channel), _) => {
+                self.send_names(channel).await?;
+            }
+            Command::QUIT(_) => return Ok(true),
+            Command::USER(_, _, _) => (),
+            other => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::ERR_UNKNOWNCOMMAND,
+                        self.nick.clone(),
+                        vec![other.variant_name(), "Unknown command".to_string()],
+                    ))
+                    .await?;
+                eprintln!("Unknown method: {other:#?}")
+            }
+        }
+
+        self.irc_sink.flush().await?;
+
+        Ok(false)
+    }
+
+    async fn handle_messagebus(&mut self, message: MessageBusMessage) -> Result<()> {
+        if message.channel == "/chat/4" {
+            let content = deserialize_messagebus_chat_message(message.data);
+            match content {
+                Ok(content) => {
+                    if !self.ignore_message_ids.contains(&content.id) {
+                        for message in content.to_irc() {
+                            self.irc_sink.send(message?).await?;
                         }
                     }
+                }
+                Err(e) => {
+                    let _ = dbg!(e);
                 }
             }
         }
 
         Ok(())
     }
+
+    async fn handle(mut self) -> Result<()> {
+        while let Some(item) = self.event_stream.next().await {
+            match item? {
+                Event::Irc(irc_message) => {
+                    if self.handle_irc(irc_message).await? {
+                        break;
+                    }
+                }
+                Event::MessageBus(message) => {
+                    self.handle_messagebus(message).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn create_event_stream(
+    chat_client: ChatClient,
+    irc_stream: impl Stream<Item = Result<Message, ProtocolError>>,
+) -> impl Stream<Item = Result<Event>> {
+    let irc_stream = irc_stream.map(|m| m.map(Event::Irc).map_err(Into::into));
+    let message_bus = MessageBus::new(
+        chat_client.client,
+        chat_client.headers,
+        chat_client.base_url,
+        &["/chat/4"],
+    )
+    .map(|m| m.map(Event::MessageBus));
+
+    tokio_stream::StreamExt::merge(irc_stream, message_bus)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -792,9 +802,18 @@ async fn main() -> Result<()> {
     loop {
         let (socket, address) = listener.accept().await?;
         println!("Received connection from {address}");
-        let mut conn = Connection::new();
+        let chat_client = ChatClient::new(
+            "https://a-lilian-garden.discourse.group",
+            "angalexik",
+            "Straight-up just my literal password stored in plaintext",
+        )
+        .await?;
+        let (irc_sink, irc_stream) = IrcCodec::new("UTF-8")?.framed(socket).split();
+        let event_stream = create_event_stream(chat_client.clone(), irc_stream);
+
+        let conn = Connection::new(irc_sink, event_stream, chat_client).await?;
         if let Err(e) = conn
-            .handle(socket)
+            .handle()
             .await
             .wrap_err_with(|| format!("Error handling connection from {address:?}"))
         {
