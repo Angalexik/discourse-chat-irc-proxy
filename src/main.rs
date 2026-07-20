@@ -818,19 +818,25 @@ mod tests {
     }
 
     impl MockLogin<'_> {
+        const CSRF_TOKEN: &'static str = "dummy_token";
+        const SESSION_COOKIE: &'static str = "dummy_session";
+
         fn mock<'a>(server: &'a MockServer) -> MockLogin<'a> {
             let mock_csrf = server.mock(|when, then| {
                 when.path("/session/csrf.json");
-                then.status(200).json_body(json!({ "csrf": "dummy-token" }));
+                then.status(200)
+                    .json_body(json!({ "csrf": Self::CSRF_TOKEN }));
             });
             let mock_session = server.mock(|when, then| {
                 when.method(POST)
                     .path("/session.json")
-                    .header("X-CSRF-Token", "dummy-token")
+                    .header("X-CSRF-Token", Self::CSRF_TOKEN)
                     .form_urlencoded_tuple("login", "test_user")
                     .form_urlencoded_tuple("password", "test_password");
-                then.status(200)
-                    .header("Set-Cookie", "_forum_session=dummy-session");
+                then.status(200).header(
+                    "Set-Cookie",
+                    format!("_forum_session={}", Self::SESSION_COOKIE),
+                );
             });
 
             MockLogin {
@@ -868,8 +874,8 @@ mod tests {
         let message_bus_mock = server.mock(|when, then| {
             when.method(POST)
                 .path_matches(r"/message-bus/[^/]+/poll")
-                .header("X-CSRF-Token", "dummy-token")
-                .cookie("_forum_session", "dummy-session")
+                .header("X-CSRF-Token", MockLogin::CSRF_TOKEN)
+                .cookie("_forum_session", MockLogin::SESSION_COOKIE)
                 .form_urlencoded_tuple_exists("__seq")
                 .form_urlencoded_tuple("/refresh_client", "-1");
             then.status(200).body(format!(
@@ -900,5 +906,37 @@ mod tests {
             "/__status".to_string()
         );
         assert!(message_bus_mock.calls() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_new_message() {
+        let server = MockServer::start();
+        let _mock = MockLogin::mock(&server);
+
+        let message_id = 2;
+
+        let message_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/4")
+                .header("X-CSRF-Token", MockLogin::CSRF_TOKEN)
+                .header("X-Requested-With", "XMLHttpRequest")
+                .cookie("_forum_session", MockLogin::SESSION_COOKIE)
+                .form_urlencoded_tuple("message", "test-message")
+                .form_urlencoded_tuple_exists("staged_id")
+                .form_urlencoded_tuple_exists("client_created_at");
+            then.status(200)
+                .json_body(json!({ "success": "OK", "message_id": 2 }));
+        });
+
+        let url: Url = server.base_url().as_str().try_into().unwrap();
+        let chat_client = ChatClient::new(url, "test_user", "test_password")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            chat_client.send_message("test-message").await.unwrap(),
+            message_id
+        );
+        message_mock.assert();
     }
 }
