@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 color-eyre = "0.6.5"
+confy = "2.0.0"
 futures = "0.3.32"
 irc = "1.1.0"
 pin-project = "1.1.13"

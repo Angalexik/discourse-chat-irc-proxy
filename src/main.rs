@@ -31,6 +31,27 @@ use tokio_util::{
 };
 use uuid::Uuid;
 
+#[derive(Serialize, Deserialize)]
+struct ServerConfig {
+    base_url: String,
+    username: String,
+    password: String,
+    channel_number: i64,
+    channel_name: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            base_url: "https://example.com".to_string(),
+            username: "miku_hatsune".to_string(),
+            password: "hunter2".to_string(),
+            channel_number: 4,
+            channel_name: "#blanket-fort".to_string(),
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct DiscourseUser {
     username: String,
@@ -797,15 +818,17 @@ async fn main() -> Result<()> {
     println!("Hello, world!");
     color_eyre::install()?;
 
+    let config: ServerConfig = confy::load("ghffdsa", Some("config"))?;
+
     let listener = TcpListener::bind("0.0.0.0:6667").await?;
 
     loop {
         let (socket, address) = listener.accept().await?;
         println!("Received connection from {address}");
         let chat_client = ChatClient::new(
-            "https://a-lilian-garden.discourse.group",
-            "angalexik",
-            "Straight-up just my literal password stored in plaintext",
+            &config.base_url,
+            &config.username,
+            &config.password,
         )
         .await?;
         let (irc_sink, irc_stream) = IrcCodec::new("UTF-8")?.framed(socket).split();
