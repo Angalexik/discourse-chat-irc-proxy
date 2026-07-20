@@ -527,7 +527,7 @@ impl Connection {
             )?)
             .await?;
 
-        self.send_names(irc_sink, &chat_client, "#blanket-fort".to_string())
+        self.send_names(irc_sink, chat_client, "#blanket-fort".to_string())
             .await?;
 
         let backlog = chat_client.message_backlog().await?;
@@ -676,8 +676,8 @@ impl Connection {
                                 .await?;
                         }
                         Command::WHO(Some(mask), _) => {
-                            if mask.to_ascii_lowercase() == self.nick.to_ascii_lowercase()
-                                || mask == "#blanket-fort"
+                            if mask.eq_ignore_ascii_case(&self.nick)
+                                || mask.eq_ignore_ascii_case("#blanket-fort")
                             {
                                 irc_sink
                                     .feed(create_response(
