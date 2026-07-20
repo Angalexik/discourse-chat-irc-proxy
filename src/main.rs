@@ -368,10 +368,11 @@ struct ChatClient {
     client: Client,
     headers: HeaderMap,
     base_url: Url,
+    username: String,
 }
 
 impl ChatClient {
-    async fn new(base_url: impl IntoUrl, login: &str, password: &str) -> Result<Self> {
+    async fn new(base_url: impl IntoUrl, login: String, password: &str) -> Result<Self> {
         let base_url = base_url.into_url()?;
 
         let client = Client::builder()
@@ -396,7 +397,10 @@ impl ChatClient {
         client
             .post(base_url.join("/session.json")?)
             .headers(headers.clone())
-            .form(&HashMap::from([("login", login), ("password", password)]))
+            .form(&HashMap::from([
+                ("login", login.as_str()),
+                ("password", password),
+            ]))
             .send()
             .await?
             .error_for_status()?;
@@ -405,6 +409,7 @@ impl ChatClient {
             client,
             headers,
             base_url,
+            username: login,
         })
     }
 
@@ -532,7 +537,7 @@ where
     async fn new(irc_sink: Si, event_stream: St, chat_client: ChatClient) -> Result<Self> {
         Ok(Self {
             connected: false,
-            nick: "".to_string(),
+            nick: chat_client.username.clone(),
             irc_sink,
             event_stream,
             chat_client,
@@ -630,8 +635,6 @@ where
                     .await?
             }
             Command::NICK(_) => {
-                self.nick = "angalexik".to_string();
-
                 if !self.connected {
                     self.connected = true;
 
@@ -825,12 +828,8 @@ async fn main() -> Result<()> {
     loop {
         let (socket, address) = listener.accept().await?;
         println!("Received connection from {address}");
-        let chat_client = ChatClient::new(
-            &config.base_url,
-            &config.username,
-            &config.password,
-        )
-        .await?;
+        let chat_client =
+            ChatClient::new(&config.base_url, config.username.clone(), &config.password).await?;
         let (irc_sink, irc_stream) = IrcCodec::new("UTF-8")?.framed(socket).split();
         let event_stream = create_event_stream(chat_client.clone(), irc_stream);
 
@@ -906,7 +905,7 @@ mod tests {
 
         let url: Url = server.base_url().as_str().try_into().unwrap();
 
-        ChatClient::new(url.clone(), "test_user", "test_password")
+        ChatClient::new(url.clone(), "test_user".to_string(), "test_password")
             .await
             .unwrap();
     }
@@ -935,7 +934,7 @@ mod tests {
         });
 
         let url: Url = server.base_url().as_str().try_into().unwrap();
-        let chat_client = ChatClient::new(url, "test_user", "test_password")
+        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
             .await
             .unwrap();
         let mut message_bus = MessageBus::new(
@@ -973,7 +972,7 @@ mod tests {
         });
 
         let url: Url = server.base_url().as_str().try_into().unwrap();
-        let chat_client = ChatClient::new(url, "test_user", "test_password")
+        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
             .await
             .unwrap();
 
