@@ -7,6 +7,7 @@ use futures::{
     stream::{self, LocalBoxStream},
 };
 use irc::proto::{
+    CapSubCommand,
     Command::{self},
     IrcCodec, Message, Response,
     error::ProtocolError,
@@ -16,12 +17,13 @@ use pin_project::pin_project;
 use reqwest::Proxy;
 use reqwest::{Client, IntoUrl, Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, pin::pin, rc::Rc};
+use std::{cell::RefCell, pin::pin, rc::Rc, str::FromStr};
 use std::{
     collections::HashMap,
     pin::Pin,
     task::{Context, Poll, ready},
 };
+use strum::{EnumString, IntoStaticStr};
 use time::{UtcDateTime, format_description::well_known::Iso8601};
 use tokio::net::TcpListener;
 use tokio_util::io::StreamReader;
@@ -518,6 +520,12 @@ enum Event {
     MessageBus(MessageBusMessage),
 }
 
+#[derive(Clone, Copy, EnumString, IntoStaticStr, PartialEq, Eq)]
+#[strum(serialize_all = "kebab-case")]
+enum Capability {
+    ServerTime,
+}
+
 #[derive(Default, Clone)]
 struct RegisteredState {
     // TODO: Replace with HashSet and remove old values to prevent memory leak
@@ -531,12 +539,22 @@ enum ConnectionState {
     Registered(RegisteredState),
 }
 
+impl ConnectionState {
+    fn is_registered(&self) -> bool {
+        match self {
+            ConnectionState::Registered(_) => true,
+            _ => false,
+        }
+    }
+}
+
 struct Connection<Si, St> {
     nick: String,
     irc_sink: Si,
     event_stream: St,
     chat_client: ChatClient,
     connection_state: ConnectionState,
+    capabilities: Vec<Capability>,
 }
 
 impl<Si, St> Connection<Si, St>
@@ -552,6 +570,7 @@ where
             event_stream,
             chat_client,
             connection_state: ConnectionState::Initial,
+            capabilities: Vec::new(),
         })
     }
 
@@ -637,6 +656,7 @@ where
     }
 
     async fn handle_irc(&mut self, irc_message: Message) -> Result<bool> {
+        dbg!(&irc_message);
         match irc_message.command {
             Command::PING(x, y) => {
                 self.irc_sink
@@ -717,6 +737,11 @@ where
             }
             Command::USER(..) => (),
             Command::PASS(_) => (),
+            Command::CAP(nick, command, param, idk) => {
+                self.connection_state = ConnectionState::Negotiating;
+                self.cap_command(nick, command, param, idk).await?;
+            }
+
             other => {
                 self.irc_sink
                     .feed(create_response(
@@ -732,8 +757,32 @@ where
         Ok(())
     }
 
-    async fn handle_negotiating(&self, irc_message: Message) -> Result<()> {
-        todo!()
+    async fn handle_negotiating(&mut self, irc_message: Message) -> Result<()> {
+        match irc_message.command {
+            Command::NICK(..) => (),
+            Command::USER(..) => (),
+            Command::PASS(_) => (),
+            Command::CAP(None, CapSubCommand::END, None, None) => {
+                self.greet_client().await?;
+                self.connection_state = ConnectionState::Registered(RegisteredState::default());
+            }
+            Command::CAP(nick, command, param, idk) => {
+                self.cap_command(nick, command, param, idk).await?;
+            }
+
+            other => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::ERR_UNKNOWNCOMMAND,
+                        self.nick.clone(),
+                        vec![other.variant_name(), "Unknown command".to_string()],
+                    ))
+                    .await?;
+                eprintln!("Unknown method: {other:#?}");
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_registered(
@@ -876,6 +925,96 @@ where
                     .await?;
                 eprintln!("Unknown method: {other:#?}")
             }
+        }
+
+        Ok(())
+    }
+
+    async fn cap_command(
+        &mut self,
+        nick: Option<String>,
+        command: CapSubCommand,
+        param: Option<String>,
+        idk: Option<String>,
+    ) -> Result<()> {
+        if nick.is_some() && idk.is_some() {
+            return Err(eyre!("Malformed CAP command"));
+        }
+
+        let nick = if self.connection_state.is_registered() {
+            &self.nick
+        } else {
+            "*"
+        };
+
+        fn cap_response<'a>(
+            subcommand: &'a str,
+            nick: &'a str,
+            mut parameters: Vec<&'a str>,
+        ) -> Message {
+            let mut args = vec![nick, subcommand];
+            args.append(&mut parameters);
+
+            Message::new(None, "CAP", args).unwrap()
+        }
+
+        match command {
+            CapSubCommand::LS => {
+                self.irc_sink
+                    .feed(cap_response("LS", nick, vec!["server-time"]))
+                    .await?
+            }
+            CapSubCommand::LIST => {
+                self.irc_sink
+                    .feed(cap_response(
+                        "LIST",
+                        nick,
+                        self.capabilities.iter().map(Into::into).collect(),
+                    ))
+                    .await?;
+            }
+            CapSubCommand::REQ => {
+                let param = param.ok_or_eyre("no extensions listed")?;
+                let (add_extensions, remove_extensions): (Vec<_>, Vec<_>) = param
+                    .split(' ')
+                    .filter_map(|mut p| {
+                        let add;
+                        if p.bytes().nth(0).unwrap() == '-' as u8 {
+                            add = false;
+                            let (_, rest) = p.split_at(1);
+                            p = rest;
+                        } else {
+                            add = true;
+                        }
+
+                        Capability::from_str(p).map(|c| (c, add)).ok()
+                    })
+                    .partition(|&(_, add)| add);
+
+                let mut add_extensions: Vec<_> =
+                    add_extensions.into_iter().map(|(c, _)| c).collect();
+
+                let remove_extensions: Vec<_> =
+                    remove_extensions.into_iter().map(|(c, _)| c).collect();
+
+                self.capabilities.append(&mut add_extensions);
+
+                // O(n^2) moment
+                self.capabilities = self
+                    .capabilities
+                    .iter()
+                    .copied()
+                    .filter(|c| !remove_extensions.contains(c))
+                    .collect();
+
+                self.irc_sink
+                    .feed(cap_response("ACK", nick, vec![&param]))
+                    .await?;
+            }
+            CapSubCommand::ACK | CapSubCommand::NAK | CapSubCommand::NEW | CapSubCommand::DEL => {
+                return Err(eyre!("Hey! That's my line!"));
+            }
+            CapSubCommand::END => unreachable!(),
         }
 
         Ok(())
