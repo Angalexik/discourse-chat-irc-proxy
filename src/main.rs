@@ -11,20 +11,24 @@ use irc::proto::{
     Command::{self},
     IrcCodec, Message, Response,
     error::ProtocolError,
+    message::Tag,
 };
 use pin_project::pin_project;
 #[allow(unused_imports)]
 use reqwest::Proxy;
 use reqwest::{Client, IntoUrl, Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, pin::pin, rc::Rc, str::FromStr};
+use std::{cell::RefCell, num::NonZeroU8, pin::pin, rc::Rc, str::FromStr};
 use std::{
     collections::HashMap,
     pin::Pin,
     task::{Context, Poll, ready},
 };
 use strum::{EnumString, IntoStaticStr};
-use time::{UtcDateTime, format_description::well_known::Iso8601};
+use time::{
+    UtcDateTime,
+    format_description::well_known::{Iso8601, Rfc3339, iso8601},
+};
 use tokio::net::TcpListener;
 use tokio_util::io::StreamReader;
 use tokio_util::{
@@ -32,6 +36,12 @@ use tokio_util::{
     codec::{Decoder, FramedRead},
 };
 use uuid::Uuid;
+
+const ISO8601_CONFIG: iso8601::EncodedConfig = iso8601::Config::DEFAULT
+    .set_time_precision(iso8601::TimePrecision::Second {
+        decimal_digits: NonZeroU8::new(3),
+    })
+    .encode();
 
 #[derive(Serialize, Deserialize)]
 struct ServerConfig {
@@ -63,6 +73,7 @@ struct DiscourseMessage {
     message: String,
     user: DiscourseUser,
     id: i64,
+    created_at: String,
 }
 
 #[allow(dead_code)]
@@ -315,22 +326,8 @@ impl VariantName for Command {
 struct ChatMessage {
     text: String,
     sender: String,
+    timestamp: UtcDateTime,
     id: i64,
-}
-
-impl ChatMessage {
-    fn to_irc(&self) -> Vec<Result<Message>> {
-        self.text
-            .lines()
-            .map(|line| {
-                Ok(Message::new(
-                    Some(&self.sender),
-                    "PRIVMSG",
-                    vec!["#blanket-fort", line],
-                )?)
-            })
-            .collect()
-    }
 }
 
 impl From<&DiscourseMessage> for ChatMessage {
@@ -339,17 +336,14 @@ impl From<&DiscourseMessage> for ChatMessage {
             text: value.message.clone(),
             sender: value.user.username.clone(),
             id: value.id,
+            timestamp: UtcDateTime::parse(&value.created_at, &Rfc3339).unwrap(),
         }
     }
 }
 
 impl From<DiscourseMessage> for ChatMessage {
     fn from(value: DiscourseMessage) -> Self {
-        ChatMessage {
-            text: value.message,
-            sender: value.user.username,
-            id: value.id,
-        }
+        From::from(&value)
     }
 }
 
@@ -442,7 +436,7 @@ impl ChatClient {
             message_id: i64,
         }
 
-        let timestamp = UtcDateTime::now().format(&Iso8601::DEFAULT)?;
+        let timestamp = UtcDateTime::now().format(&Iso8601::<ISO8601_CONFIG>)?;
         let response = self
             .client
             .post(self.base_url.join("/chat/4")?)
@@ -541,10 +535,7 @@ enum ConnectionState {
 
 impl ConnectionState {
     fn is_registered(&self) -> bool {
-        match self {
-            ConnectionState::Registered(_) => true,
-            _ => false,
-        }
+        matches!(self, ConnectionState::Registered(_))
     }
 }
 
@@ -612,11 +603,46 @@ where
 
         let backlog = self.chat_client.message_backlog().await?;
 
-        for message in backlog.iter().flat_map(|message| message.to_irc()) {
+        for message in backlog
+            .iter()
+            .flat_map(|message| self.chat_message_to_irc(message))
+            .collect::<Vec<_>>()
+        {
             self.irc_sink.feed(message?).await?;
         }
 
         Ok(())
+    }
+
+    fn chat_message_to_irc(&self, message: &ChatMessage) -> Vec<Result<Message>> {
+        message
+            .text
+            .lines()
+            .map(|line| {
+                if self.capabilities.contains(&Capability::ServerTime) {
+                    Ok(Message::with_tags(
+                        Some(vec![Tag(
+                            "time".to_string(),
+                            Some(
+                                message
+                                    .timestamp
+                                    .format(&Iso8601::<ISO8601_CONFIG>)
+                                    .unwrap(),
+                            ),
+                        )]),
+                        Some(&message.sender),
+                        "PRIVMSG",
+                        vec!["#blanket-fort", line],
+                    )?)
+                } else {
+                    Ok(Message::new(
+                        Some(&message.sender),
+                        "PRIVMSG",
+                        vec!["#blanket-fort", line],
+                    )?)
+                }
+            })
+            .collect()
     }
 
     async fn send_names(&mut self, channel: String) -> Result<()> {
@@ -656,7 +682,6 @@ where
     }
 
     async fn handle_irc(&mut self, irc_message: Message) -> Result<bool> {
-        dbg!(&irc_message);
         match irc_message.command {
             Command::PING(x, y) => {
                 self.irc_sink
@@ -697,7 +722,7 @@ where
                             .borrow()
                             .contains(&content.id)
                         {
-                            for message in content.to_irc() {
+                            for message in self.chat_message_to_irc(&content) {
                                 self.irc_sink.send(message?).await?;
                             }
                         }
@@ -979,7 +1004,7 @@ where
                     .split(' ')
                     .filter_map(|mut p| {
                         let add;
-                        if p.bytes().nth(0).unwrap() == '-' as u8 {
+                        if p.as_bytes()[0] == b'-' {
                             add = false;
                             let (_, rest) = p.split_at(1);
                             p = rest;
