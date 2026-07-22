@@ -1,11 +1,7 @@
+mod discourse_chat;
+
 use color_eyre::eyre::{Context as _, OptionExt, Result, eyre};
-use futures::{
-    FutureExt, Sink, Stream, StreamExt,
-    future::LocalBoxFuture,
-    io,
-    sink::SinkExt,
-    stream::{self, LocalBoxStream},
-};
+use futures::{Sink, Stream, StreamExt, sink::SinkExt};
 use irc::proto::{
     CapSubCommand,
     Command::{self},
@@ -13,29 +9,16 @@ use irc::proto::{
     error::ProtocolError,
     message::Tag,
 };
-use pin_project::pin_project;
 #[allow(unused_imports)]
 use reqwest::Proxy;
-use reqwest::{Client, IntoUrl, Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, num::NonZeroU8, pin::pin, rc::Rc, str::FromStr};
-use std::{
-    collections::HashMap,
-    pin::Pin,
-    task::{Context, Poll, ready},
-};
+use std::{cell::RefCell, num::NonZeroU8, rc::Rc, str::FromStr};
 use strum::{EnumString, IntoStaticStr};
-use time::{
-    UtcDateTime,
-    format_description::well_known::{Iso8601, Rfc3339, iso8601},
-};
+use time::format_description::well_known::{Iso8601, iso8601};
 use tokio::{net::TcpListener, task};
-use tokio_util::io::StreamReader;
-use tokio_util::{
-    bytes::Bytes,
-    codec::{Decoder, FramedRead},
-};
-use uuid::Uuid;
+use tokio_util::codec::Decoder;
+
+use crate::discourse_chat::{ChatClient, ChatMessage, MessageBus, MessageBusMessage};
 
 const ISO8601_CONFIG: iso8601::EncodedConfig = iso8601::Config::DEFAULT
     .set_time_precision(iso8601::TimePrecision::Second {
@@ -60,188 +43,6 @@ impl Default for ServerConfig {
             password: "hunter2".to_string(),
             channel_number: 4,
             channel_name: "#blanket-fort".to_string(),
-        }
-    }
-}
-
-#[derive(Deserialize, Debug)]
-struct DiscourseUser {
-    username: String,
-}
-#[derive(Deserialize, Debug)]
-struct DiscourseMessage {
-    message: String,
-    user: DiscourseUser,
-    id: i64,
-    created_at: String,
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize, Serialize, Clone)]
-struct MessageBusMessage {
-    global_id: i64,
-    message_id: i64,
-    channel: String,
-    data: serde_json::Value,
-}
-
-struct MessageBusCodec {}
-
-impl MessageBusCodec {
-    const DELIMITER: &[u8] = "\r\n|\r\n".as_bytes();
-
-    fn parse_message(
-        &self,
-        bytes: Bytes,
-    ) -> std::result::Result<<Self as Decoder>::Item, <Self as Decoder>::Error> {
-        serde_json::from_slice(&bytes).map_err(io::Error::other)
-    }
-}
-
-impl Decoder for MessageBusCodec {
-    type Item = Vec<MessageBusMessage>;
-    type Error = io::Error;
-
-    fn decode(
-        &mut self,
-        buf: &mut tokio_util::bytes::BytesMut,
-    ) -> std::result::Result<Option<Self::Item>, Self::Error> {
-        let offset = buf.windows(5).position(|bytes| bytes == Self::DELIMITER);
-
-        if let Some(offset) = offset {
-            let mut chunk = buf.split_to(offset + Self::DELIMITER.len());
-            chunk.truncate(chunk.len() - Self::DELIMITER.len());
-            let chunk = chunk.freeze();
-            let messages = self.parse_message(chunk);
-
-            Ok(Some(messages?))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-type MessageBusStreamItem =
-    std::result::Result<MessageBusMessage, <MessageBusCodec as Decoder>::Error>;
-
-#[pin_project(project = MessageBusStateProj)]
-enum MessageBusState<'a> {
-    Connected(LocalBoxStream<'a, MessageBusStreamItem>),
-    Connecting(LocalBoxFuture<'a, Result<LocalBoxStream<'a, MessageBusStreamItem>>>),
-}
-
-#[derive(Clone)]
-struct MessageBusInner {
-    client: Client,
-    headers: HeaderMap,
-    base_url: Url,
-    channels: HashMap<String, i64>,
-    client_id: u128,
-    sequence_number: i64,
-}
-
-impl MessageBusInner {
-    async fn get_stream<'a>(mut self) -> Result<LocalBoxStream<'a, MessageBusStreamItem>> {
-        self.channels
-            .insert("__seq".to_string(), self.sequence_number);
-        let response = self
-            .client
-            .post(
-                self.base_url
-                    .join("/message-bus/")?
-                    .join(&format!("{:#x}/", self.client_id))?
-                    .join("poll")?,
-            )
-            .form(&self.channels)
-            .headers(self.headers)
-            .send()
-            .await?;
-
-        let messages = FramedRead::new(
-            StreamReader::new(response.bytes_stream().map(|r| r.map_err(io::Error::other))),
-            MessageBusCodec {},
-        )
-        .flat_map(|item| {
-            let msgs: Vec<_> = match item {
-                Ok(inner) => inner.iter().map(|x| Ok(x.clone())).collect(),
-                Err(e) => vec![Err(e)],
-            };
-
-            stream::iter(msgs)
-        });
-
-        Ok(messages.boxed_local())
-    }
-}
-
-#[pin_project]
-struct MessageBus<'a> {
-    inner: MessageBusInner,
-    #[pin]
-    state: MessageBusState<'a>,
-}
-
-impl MessageBus<'_> {
-    fn new(client: Client, headers: HeaderMap, base_url: Url, channels: &[&str]) -> Self {
-        let client_id: u128 = rand::random();
-        let channels = channels
-            .iter()
-            .map(|channel| (channel.to_string(), -1))
-            .collect();
-
-        let inner = MessageBusInner {
-            client,
-            headers,
-            base_url,
-            channels,
-            client_id,
-            sequence_number: 1,
-        };
-        let future = inner.clone().get_stream().boxed_local();
-
-        Self {
-            inner,
-            state: MessageBusState::Connecting(future),
-        }
-    }
-}
-
-impl Stream for MessageBus<'_> {
-    type Item = Result<MessageBusMessage>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.as_mut().project();
-
-        match this.state.as_mut().project() {
-            MessageBusStateProj::Connected(stream) => {
-                if let Some(message) = ready!(stream.as_mut().poll_next(cx)) {
-                    // TODO: Handle __status properly
-                    if let Ok(MessageBusMessage {
-                        message_id,
-                        channel,
-                        ..
-                    }) = &message
-                        && let Some(entry) = self.inner.channels.get_mut(channel)
-                    {
-                        *entry = *message_id;
-                    }
-                    return Poll::Ready(Some(message.map_err(Into::into)));
-                }
-
-                this.inner.sequence_number += 1;
-                let future = this.inner.clone().get_stream().boxed_local();
-
-                this.state.set(MessageBusState::Connecting(future));
-
-                self.poll_next(cx)
-            }
-            MessageBusStateProj::Connecting(future) => match ready!(future.as_mut().poll(cx)) {
-                Ok(stream) => {
-                    self.state = MessageBusState::Connected(stream);
-                    self.poll_next(cx)
-                }
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
         }
     }
 }
@@ -323,30 +124,6 @@ impl VariantName for Command {
     }
 }
 
-struct ChatMessage {
-    text: String,
-    sender: String,
-    timestamp: UtcDateTime,
-    id: i64,
-}
-
-impl From<&DiscourseMessage> for ChatMessage {
-    fn from(value: &DiscourseMessage) -> Self {
-        ChatMessage {
-            text: value.message.clone(),
-            sender: value.user.username.clone(),
-            id: value.id,
-            timestamp: UtcDateTime::parse(&value.created_at, &Rfc3339).unwrap(),
-        }
-    }
-}
-
-impl From<DiscourseMessage> for ChatMessage {
-    fn from(value: DiscourseMessage) -> Self {
-        From::from(&value)
-    }
-}
-
 fn create_response(response: Response, client: String, arguments: Vec<String>) -> Message {
     let mut full_arguments = Vec::with_capacity(arguments.len() + 1);
     full_arguments.push(client);
@@ -356,156 +133,6 @@ fn create_response(response: Response, client: String, arguments: Vec<String>) -
         tags: None,
         prefix: None,
         command: Command::Response(response, full_arguments),
-    }
-}
-
-#[derive(Clone)]
-struct ChatClient {
-    client: Client,
-    headers: HeaderMap,
-    base_url: Url,
-    username: String,
-}
-
-impl ChatClient {
-    async fn new(base_url: impl IntoUrl, login: String, password: &str) -> Result<Self> {
-        let base_url = base_url.into_url()?;
-
-        let client = Client::builder()
-            .cookie_store(true)
-            .user_agent("DiscourseIRC/0.0.1")
-            // .proxy(Proxy::all("http://127.0.0.1:8080")?)
-            .build()?;
-        let csrf_token = client
-            .get(base_url.join("/session/csrf.json")?)
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?["csrf"]
-            .as_str()
-            .ok_or_eyre("CSRF token was not a string")?
-            .to_owned();
-
-        let mut headers = HeaderMap::new();
-        headers.insert("X-CSRF-Token", csrf_token.parse()?);
-        headers.insert("X-Requested-With", "XMLHttpRequest".parse()?);
-
-        client
-            .post(base_url.join("/session.json")?)
-            .headers(headers.clone())
-            .form(&HashMap::from([
-                ("login", login.as_str()),
-                ("password", password),
-            ]))
-            .send()
-            .await?
-            .error_for_status()?;
-
-        Ok(Self {
-            client,
-            headers,
-            base_url,
-            username: login,
-        })
-    }
-
-    async fn message_backlog(&self) -> Result<Vec<ChatMessage>> {
-        #[derive(Deserialize)]
-        struct ApiResponse {
-            messages: Vec<DiscourseMessage>,
-        }
-
-        let messages = self
-            .client
-            .get(self.base_url.join("/chat/api/channels/4/messages")?)
-            .headers(self.headers.clone())
-            .query(&[("page_size", 50)])
-            .send()
-            .await?
-            .json::<ApiResponse>()
-            .await?
-            .messages;
-
-        Ok(messages.iter().map(|m| m.into()).collect())
-    }
-
-    async fn send_message(&self, text: &str) -> Result<i64> {
-        #[derive(Deserialize)]
-        struct ApiResponse {
-            success: String,
-            message_id: i64,
-        }
-
-        let timestamp = UtcDateTime::now().format(&Iso8601::<ISO8601_CONFIG>)?;
-        let response = self
-            .client
-            .post(self.base_url.join("/chat/4")?)
-            .headers(self.headers.clone())
-            .form(&[
-                ("message", text),
-                ("staged_id", &Uuid::new_v4().to_string()),
-                ("client_created_at", &timestamp),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<ApiResponse>()
-            .await?;
-
-        let status = response.success;
-        if status == "OK" {
-            Ok(response.message_id)
-        } else {
-            Err(eyre!("expected status `OK`, instead received `{status}`"))
-        }
-    }
-
-    async fn list_users(&self) -> Result<Vec<String>> {
-        #[derive(Deserialize)]
-        struct GlobalPresenceChannelState {
-            users: Vec<DiscourseUser>,
-        }
-
-        #[derive(Deserialize)]
-        struct ApiResponse {
-            global_presence_channel_state: GlobalPresenceChannelState,
-        }
-
-        Ok(self
-            .client
-            .get(self.base_url.join("/chat/api/me/channels")?)
-            .headers(self.headers.clone())
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<ApiResponse>()
-            .await?
-            .global_presence_channel_state
-            .users
-            .into_iter()
-            .map(|user| user.username)
-            .collect())
-    }
-}
-
-// naming is my passion
-fn deserialize_messagebus_chat_message(data: serde_json::Value) -> Result<ChatMessage> {
-    #[derive(Deserialize, Debug)]
-    #[serde(tag = "type")]
-    #[serde(rename_all = "lowercase")]
-    enum Data {
-        Sent { chat_message: DiscourseMessage },
-    }
-
-    let deserialized = serde_json::from_value::<Data>(data)?;
-
-    if let Data::Sent { chat_message } = deserialized {
-        Ok((&chat_message).into())
-    } else {
-        Err(eyre!(
-            "Expected variant Data::Sent, instead got {:?}",
-            deserialized
-        ))
     }
 }
 
@@ -714,7 +341,7 @@ where
     async fn handle_messagebus(&mut self, message: MessageBusMessage) -> Result<()> {
         if let ConnectionState::Registered(registered_state) = &self.connection_state {
             if message.channel == "/chat/4" {
-                let content = deserialize_messagebus_chat_message(message.data);
+                let content = discourse_chat::deserialize_messagebus_chat_message(message.data);
                 match content {
                     Ok(content) => {
                         if !registered_state
@@ -1051,13 +678,7 @@ fn create_event_stream(
     irc_stream: impl Stream<Item = Result<Message, ProtocolError>>,
 ) -> impl Stream<Item = Result<Event>> {
     let irc_stream = irc_stream.map(|m| m.map(Event::Irc).map_err(Into::into));
-    let message_bus = MessageBus::new(
-        chat_client.client,
-        chat_client.headers,
-        chat_client.base_url,
-        &["/chat/4"],
-    )
-    .map(|m| m.map(Event::MessageBus));
+    let message_bus = MessageBus::new(chat_client, &["/chat/4"]).map(|m| m.map(Event::MessageBus));
 
     tokio_stream::StreamExt::merge(irc_stream, message_bus)
 }
@@ -1089,145 +710,5 @@ async fn main() -> Result<()> {
                 eprintln!("{e:?}");
             }
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::MessageBusMessage;
-
-    use super::{ChatClient, MessageBus};
-
-    use futures::StreamExt;
-    use httpmock::{Mock, prelude::*};
-    use reqwest::Url;
-    use serde_json::json;
-
-    struct MockLogin<'a> {
-        mock_csrf: Mock<'a>,
-        mock_session: Mock<'a>,
-    }
-
-    impl MockLogin<'_> {
-        const CSRF_TOKEN: &'static str = "dummy_token";
-        const SESSION_COOKIE: &'static str = "dummy_session";
-
-        fn mock<'a>(server: &'a MockServer) -> MockLogin<'a> {
-            let mock_csrf = server.mock(|when, then| {
-                when.path("/session/csrf.json");
-                then.status(200)
-                    .json_body(json!({ "csrf": Self::CSRF_TOKEN }));
-            });
-            let mock_session = server.mock(|when, then| {
-                when.method(POST)
-                    .path("/session.json")
-                    .header("X-CSRF-Token", Self::CSRF_TOKEN)
-                    .form_urlencoded_tuple("login", "test_user")
-                    .form_urlencoded_tuple("password", "test_password");
-                then.status(200).header(
-                    "Set-Cookie",
-                    format!("_forum_session={}", Self::SESSION_COOKIE),
-                );
-            });
-
-            MockLogin {
-                mock_csrf,
-                mock_session,
-            }
-        }
-    }
-
-    impl Drop for MockLogin<'_> {
-        fn drop(&mut self) {
-            self.mock_session.assert();
-            self.mock_csrf.assert();
-        }
-    }
-
-    #[tokio::test]
-    async fn test_discourse_login() {
-        let server = MockServer::start();
-        // Assigned to `_mock` instead of just `_` in order for the value to get dropped at
-        // the end of this function scope
-        let _mock = MockLogin::mock(&server);
-
-        let url: Url = server.base_url().as_str().try_into().unwrap();
-
-        ChatClient::new(url.clone(), "test_user".to_string(), "test_password")
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_message_bus() {
-        let server = MockServer::start();
-        let _mock = MockLogin::mock(&server);
-        let message_bus_mock = server.mock(|when, then| {
-            when.method(POST)
-                .path_matches(r"/message-bus/[^/]+/poll")
-                .header("X-CSRF-Token", MockLogin::CSRF_TOKEN)
-                .cookie("_forum_session", MockLogin::SESSION_COOKIE)
-                .form_urlencoded_tuple_exists("__seq")
-                .form_urlencoded_tuple("/refresh_client", "-1");
-            then.status(200).body(format!(
-                "{}\r\n|\r\n",
-                serde_json::to_string(&vec![MessageBusMessage {
-                    global_id: -1,
-                    message_id: -1,
-                    channel: "/__status".to_string(),
-                    data: json!({}),
-                }])
-                .unwrap()
-            ));
-        });
-
-        let url: Url = server.base_url().as_str().try_into().unwrap();
-        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
-            .await
-            .unwrap();
-        let mut message_bus = MessageBus::new(
-            chat_client.client,
-            chat_client.headers,
-            chat_client.base_url,
-            &["/refresh_client"],
-        );
-
-        assert_eq!(
-            message_bus.next().await.unwrap().unwrap().channel,
-            "/__status".to_string()
-        );
-        assert!(message_bus_mock.calls() > 0);
-    }
-
-    #[tokio::test]
-    async fn test_new_message() {
-        let server = MockServer::start();
-        let _mock = MockLogin::mock(&server);
-
-        let message_id = 2;
-
-        let message_mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/chat/4")
-                .header("X-CSRF-Token", MockLogin::CSRF_TOKEN)
-                .header("X-Requested-With", "XMLHttpRequest")
-                .cookie("_forum_session", MockLogin::SESSION_COOKIE)
-                .form_urlencoded_tuple("message", "test-message")
-                .form_urlencoded_tuple_exists("staged_id")
-                .form_urlencoded_tuple_exists("client_created_at");
-            then.status(200)
-                .json_body(json!({ "success": "OK", "message_id": 2 }));
-        });
-
-        let url: Url = server.base_url().as_str().try_into().unwrap();
-        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            chat_client.send_message("test-message").await.unwrap(),
-            message_id
-        );
-        message_mock.assert();
     }
 }
