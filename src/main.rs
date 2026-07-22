@@ -29,7 +29,7 @@ use time::{
     UtcDateTime,
     format_description::well_known::{Iso8601, Rfc3339, iso8601},
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, task};
 use tokio_util::io::StreamReader;
 use tokio_util::{
     bytes::Bytes,
@@ -554,15 +554,15 @@ where
     Si::Error: core::error::Error + Sync + Send + 'static,
     St: Stream<Item = Result<Event>> + Unpin,
 {
-    async fn new(irc_sink: Si, event_stream: St, chat_client: ChatClient) -> Result<Self> {
-        Ok(Self {
+    async fn new(irc_sink: Si, event_stream: St, chat_client: ChatClient) -> Self {
+        Self {
             nick: chat_client.username.clone(),
             irc_sink,
             event_stream,
             chat_client,
             connection_state: ConnectionState::Initial,
             capabilities: Vec::new(),
-        })
+        }
     }
 
     async fn greet_client(&mut self) -> Result<()> {
@@ -1062,7 +1062,7 @@ fn create_event_stream(
     tokio_stream::StreamExt::merge(irc_stream, message_bus)
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "local")]
 async fn main() -> Result<()> {
     println!("Hello, world!");
     color_eyre::install()?;
@@ -1079,14 +1079,16 @@ async fn main() -> Result<()> {
         let (irc_sink, irc_stream) = IrcCodec::new("UTF-8")?.framed(socket).split();
         let event_stream = create_event_stream(chat_client.clone(), irc_stream);
 
-        let conn = Connection::new(irc_sink, event_stream, chat_client).await?;
-        if let Err(e) = conn
-            .handle()
-            .await
-            .wrap_err_with(|| format!("Error handling connection from {address:?}"))
-        {
-            eprintln!("{e:?}");
-        }
+        task::spawn_local(async move {
+            let conn = Connection::new(irc_sink, event_stream, chat_client).await;
+            if let Err(e) = conn
+                .handle()
+                .await
+                .wrap_err_with(|| format!("Error handling connection from {address:?}"))
+            {
+                eprintln!("{e:?}");
+            }
+        });
     }
 }
 
