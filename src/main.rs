@@ -16,7 +16,7 @@ use pin_project::pin_project;
 use reqwest::Proxy;
 use reqwest::{Client, IntoUrl, Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
-use std::pin::pin;
+use std::{cell::RefCell, pin::pin, rc::Rc};
 use std::{
     collections::HashMap,
     pin::Pin,
@@ -305,7 +305,7 @@ impl VariantName for Command {
             Command::BATCH(_, _, _) => "BATCH".to_string(),
             Command::CHGHOST(_, _) => "CHGHOST".to_string(),
             Command::Response(_, _) => "Response".to_string(),
-            Command::Raw(_, _) => "Raw".to_string(),
+            Command::Raw(command, _) => command.to_owned(),
         }
     }
 }
@@ -518,14 +518,25 @@ enum Event {
     MessageBus(MessageBusMessage),
 }
 
+#[derive(Default, Clone)]
+struct RegisteredState {
+    // TODO: Replace with HashSet and remove old values to prevent memory leak
+    ignore_message_ids: Rc<RefCell<Vec<i64>>>,
+}
+
+#[derive(Clone)]
+enum ConnectionState {
+    Initial,
+    Negotiating,
+    Registered(RegisteredState),
+}
+
 struct Connection<Si, St> {
-    connected: bool,
     nick: String,
     irc_sink: Si,
     event_stream: St,
     chat_client: ChatClient,
-    // TODO: Replace with HashSet and remove old values to prevent memory leak
-    ignore_message_ids: Vec<i64>,
+    connection_state: ConnectionState,
 }
 
 impl<Si, St> Connection<Si, St>
@@ -536,12 +547,11 @@ where
 {
     async fn new(irc_sink: Si, event_stream: St, chat_client: ChatClient) -> Result<Self> {
         Ok(Self {
-            connected: false,
             nick: chat_client.username.clone(),
             irc_sink,
             event_stream,
             chat_client,
-            ignore_message_ids: Vec::new(),
+            connection_state: ConnectionState::Initial,
         })
     }
 
@@ -592,7 +602,10 @@ where
 
     async fn send_names(&mut self, channel: String) -> Result<()> {
         if channel.eq_ignore_ascii_case("#blanket-fort") {
-            let users = self.chat_client.list_users().await?;
+            let mut users = self.chat_client.list_users().await?;
+            if !users.iter().any(|u| u.eq_ignore_ascii_case(&self.nick)) {
+                users.push(self.nick.clone());
+            }
             let arguments = vec!["=".to_string(), channel.clone()];
 
             self.irc_sink
@@ -627,25 +640,115 @@ where
         match irc_message.command {
             Command::PING(x, y) => {
                 self.irc_sink
-                    .feed(Message {
+                    .send(Message {
                         tags: None,
                         prefix: None,
                         command: Command::PONG(x, y),
                     })
+                    .await?;
+                return Ok(false);
+            }
+            Command::QUIT(_) => return Ok(true),
+            _ => (),
+        }
+
+        match self.connection_state.clone() {
+            ConnectionState::Initial => self.handle_initial(irc_message).await?,
+            ConnectionState::Negotiating => self.handle_negotiating(irc_message).await?,
+            ConnectionState::Registered(mut registered_state) => {
+                self.handle_registered(irc_message, &mut registered_state)
                     .await?
             }
-            Command::NICK(_) => {
-                if !self.connected {
-                    self.connected = true;
+        }
 
-                    self.greet_client().await?;
-                    self.irc_sink.flush().await?;
+        self.irc_sink.flush().await?;
+
+        Ok(false)
+    }
+
+    async fn handle_messagebus(&mut self, message: MessageBusMessage) -> Result<()> {
+        if let ConnectionState::Registered(registered_state) = &self.connection_state {
+            if message.channel == "/chat/4" {
+                let content = deserialize_messagebus_chat_message(message.data);
+                match content {
+                    Ok(content) => {
+                        if !registered_state
+                            .ignore_message_ids
+                            .borrow()
+                            .contains(&content.id)
+                        {
+                            for message in content.to_irc() {
+                                self.irc_sink.send(message?).await?;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = dbg!(e);
+                    }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn handle(mut self) -> Result<()> {
+        while let Some(item) = self.event_stream.next().await {
+            match item? {
+                Event::Irc(irc_message) => {
+                    if self.handle_irc(irc_message).await? {
+                        break;
+                    }
+                }
+                Event::MessageBus(message) => {
+                    self.handle_messagebus(message).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_initial(&mut self, irc_message: Message) -> Result<()> {
+        match irc_message.command {
+            Command::NICK(_) => {
+                self.greet_client().await?;
+                self.connection_state = ConnectionState::Registered(RegisteredState::default());
+            }
+            Command::USER(..) => (),
+            Command::PASS(_) => (),
+            other => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::ERR_UNKNOWNCOMMAND,
+                        self.nick.clone(),
+                        vec![other.variant_name(), "Unknown command".to_string()],
+                    ))
+                    .await?;
+                eprintln!("Unknown method: {other:#?}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_negotiating(&self, irc_message: Message) -> Result<()> {
+        todo!()
+    }
+
+    async fn handle_registered(
+        &mut self,
+        irc_message: Message,
+        registered_state: &mut RegisteredState,
+    ) -> Result<()> {
+        match irc_message.command {
             Command::PRIVMSG(target, text) => {
                 if target == "#blanket-fort" {
                     let message_id = self.chat_client.send_message(&text).await?;
-                    self.ignore_message_ids.push(dbg!(message_id));
+                    registered_state
+                        .ignore_message_ids
+                        .borrow_mut()
+                        .push(dbg!(message_id));
                 } else {
                     self.irc_sink
                         .feed(Message {
@@ -743,8 +846,26 @@ where
             Command::NAMES(Some(channel), _) => {
                 self.send_names(channel).await?;
             }
-            Command::QUIT(_) => return Ok(true),
-            Command::USER(_, _, _) => (),
+            Command::NICK(new_nick) => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::ERR_ERRONEOUSNICKNAME,
+                        self.nick.clone(),
+                        vec![new_nick, "Erroneus nickname".to_string()],
+                    ))
+                    .await?;
+            }
+            Command::USER(..) => {
+                // self.irc_sink
+                //     .feed(create_response(
+                //         Response::ERR_ALREADYREGISTRED,
+                //         self.nick.clone(),
+                //         vec!["You may not reregister".to_string()],
+                //     ))
+                //     .await?;
+            }
+            Command::PING(..) => unreachable!(),
+            Command::QUIT(..) => unreachable!(),
             other => {
                 self.irc_sink
                     .feed(create_response(
@@ -754,45 +875,6 @@ where
                     ))
                     .await?;
                 eprintln!("Unknown method: {other:#?}")
-            }
-        }
-
-        self.irc_sink.flush().await?;
-
-        Ok(false)
-    }
-
-    async fn handle_messagebus(&mut self, message: MessageBusMessage) -> Result<()> {
-        if message.channel == "/chat/4" {
-            let content = deserialize_messagebus_chat_message(message.data);
-            match content {
-                Ok(content) => {
-                    if !self.ignore_message_ids.contains(&content.id) {
-                        for message in content.to_irc() {
-                            self.irc_sink.send(message?).await?;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = dbg!(e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle(mut self) -> Result<()> {
-        while let Some(item) = self.event_stream.next().await {
-            match item? {
-                Event::Irc(irc_message) => {
-                    if self.handle_irc(irc_message).await? {
-                        break;
-                    }
-                }
-                Event::MessageBus(message) => {
-                    self.handle_messagebus(message).await?;
-                }
             }
         }
 
