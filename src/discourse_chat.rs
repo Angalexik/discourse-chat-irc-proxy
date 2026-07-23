@@ -29,9 +29,10 @@ use uuid::Uuid;
 
 use crate::ISO8601_CONFIG;
 
-#[derive(Deserialize, Debug)]
-struct DiscourseUser {
-    username: String,
+#[derive(Deserialize, Debug, Hash, PartialEq, Eq, Clone)]
+pub struct DiscourseUser {
+    pub username: String,
+    pub id: i64,
 }
 #[derive(Deserialize, Debug)]
 struct DiscourseMessage {
@@ -47,7 +48,44 @@ pub struct MessageBusMessage {
     global_id: i64,
     message_id: i64,
     pub channel: String,
-    pub data: serde_json::Value,
+    data: serde_json::Value,
+}
+
+impl MessageBusMessage {
+    pub fn deserialize_chat_message(self) -> Result<ChatMessage> {
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "type")]
+        #[serde(rename_all = "lowercase")]
+        enum Data {
+            Sent { chat_message: DiscourseMessage },
+        }
+
+        let deserialized = serde_json::from_value::<Data>(self.data)?;
+
+        if let Data::Sent { chat_message } = deserialized {
+            Ok((&chat_message).into())
+        } else {
+            Err(eyre!(
+                "Expected variant Data::Sent, instead got {:?}",
+                deserialized
+            ))
+        }
+    }
+
+    pub fn deserialize_presence(self) -> (Vec<DiscourseUser>, Vec<i64>) {
+        #[derive(Deserialize)]
+        struct Data {
+            entering_users: Option<Vec<DiscourseUser>>,
+            leaving_user_ids: Option<Vec<i64>>,
+        }
+
+        let deserialized = serde_json::from_value::<Data>(self.data).unwrap();
+
+        (
+            deserialized.entering_users.unwrap_or_default(),
+            deserialized.leaving_user_ids.unwrap_or_default(),
+        )
+    }
 }
 
 struct MessageBusCodec {}
@@ -339,7 +377,7 @@ impl ChatClient {
         }
     }
 
-    pub async fn list_users(&self) -> Result<Vec<String>> {
+    pub async fn list_users(&self) -> Result<Vec<DiscourseUser>> {
         #[derive(Deserialize)]
         struct GlobalPresenceChannelState {
             users: Vec<DiscourseUser>,
@@ -362,29 +400,7 @@ impl ChatClient {
             .global_presence_channel_state
             .users
             .into_iter()
-            .map(|user| user.username)
             .collect())
-    }
-}
-
-// naming is my passion
-pub fn deserialize_messagebus_chat_message(data: serde_json::Value) -> Result<ChatMessage> {
-    #[derive(Deserialize, Debug)]
-    #[serde(tag = "type")]
-    #[serde(rename_all = "lowercase")]
-    enum Data {
-        Sent { chat_message: DiscourseMessage },
-    }
-
-    let deserialized = serde_json::from_value::<Data>(data)?;
-
-    if let Data::Sent { chat_message } = deserialized {
-        Ok((&chat_message).into())
-    } else {
-        Err(eyre!(
-            "Expected variant Data::Sent, instead got {:?}",
-            deserialized
-        ))
     }
 }
 

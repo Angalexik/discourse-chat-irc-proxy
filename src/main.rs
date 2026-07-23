@@ -12,7 +12,7 @@ use irc::proto::{
 #[allow(unused_imports)]
 use reqwest::Proxy;
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, num::NonZeroU8, rc::Rc, str::FromStr};
+use std::{cell::RefCell, collections::HashMap, num::NonZeroU8, rc::Rc, str::FromStr};
 use strum::{EnumString, IntoStaticStr};
 use time::format_description::well_known::{Iso8601, iso8601};
 use tokio::{net::TcpListener, task};
@@ -171,6 +171,7 @@ struct Connection<Si, St> {
     irc_sink: Si,
     event_stream: St,
     chat_client: ChatClient,
+    users: HashMap<i64, String>,
     connection_state: ConnectionState,
     capabilities: Vec<Capability>,
 }
@@ -187,6 +188,7 @@ where
             irc_sink,
             event_stream,
             chat_client,
+            users: HashMap::new(),
             connection_state: ConnectionState::Initial,
             capabilities: Vec::new(),
         }
@@ -272,12 +274,17 @@ where
             .collect()
     }
 
+    fn users_list(&self) -> Vec<String> {
+        let mut users: Vec<_> = self.users.values().cloned().collect();
+        if !users.iter().any(|u| u.eq_ignore_ascii_case(&self.nick)) {
+            users.push(self.nick.clone());
+        }
+        users
+    }
+
     async fn send_names(&mut self, channel: String) -> Result<()> {
         if channel.eq_ignore_ascii_case("#blanket-fort") {
-            let mut users = self.chat_client.list_users().await?;
-            if !users.iter().any(|u| u.eq_ignore_ascii_case(&self.nick)) {
-                users.push(self.nick.clone());
-            }
+            let users = self.users_list();
             let arguments = vec!["=".to_string(), channel.clone()];
 
             self.irc_sink
@@ -309,6 +316,7 @@ where
     }
 
     async fn handle_irc(&mut self, irc_message: Message) -> Result<bool> {
+        dbg!(&irc_message, &self.users);
         match irc_message.command {
             Command::PING(x, y) => {
                 self.irc_sink
@@ -339,32 +347,80 @@ where
     }
 
     async fn handle_messagebus(&mut self, message: MessageBusMessage) -> Result<()> {
-        if let ConnectionState::Registered(registered_state) = &self.connection_state {
-            if message.channel == "/chat/4" {
-                let content = discourse_chat::deserialize_messagebus_chat_message(message.data);
-                match content {
-                    Ok(content) => {
-                        if !registered_state
-                            .ignore_message_ids
-                            .borrow()
-                            .contains(&content.id)
-                        {
-                            for message in self.chat_message_to_irc(&content) {
-                                self.irc_sink.send(message?).await?;
+        match message.channel.as_str() {
+            "/presence/chat/online" => {
+                let (entering, leaving) = message.deserialize_presence();
+
+                // TODO: Make the display of JOIN and PART messages configurable, since some clients
+                // show them in quite a distracting way
+                for u in entering {
+                    if self.users.insert(u.id, u.username.clone()).is_none()
+                        && !u.username.eq_ignore_ascii_case(&self.nick)
+                        && matches!(self.connection_state, ConnectionState::Registered(_))
+                    {
+                        self.irc_sink
+                            .feed(Message::new(
+                                Some(&u.username),
+                                "JOIN",
+                                vec!["#blanket-fort"],
+                            )?)
+                            .await?;
+                    }
+                }
+
+                for id in leaving {
+                    if let Some(username) = self.users.remove(&id)
+                        && !username.eq_ignore_ascii_case(&self.nick)
+                        && matches!(self.connection_state, ConnectionState::Registered(_))
+                    {
+                        self.irc_sink
+                            .feed(Message::new(
+                                Some(&username),
+                                "PART",
+                                vec!["#blanket-fort"],
+                            )?)
+                            .await?;
+                    }
+                }
+
+                self.irc_sink.flush().await?;
+            }
+            "/chat/4" => {
+                if let ConnectionState::Registered(registered_state) = &self.connection_state {
+                    let content = message.deserialize_chat_message();
+                    match content {
+                        Ok(content) => {
+                            if !registered_state
+                                .ignore_message_ids
+                                .borrow()
+                                .contains(&content.id)
+                            {
+                                for message in self.chat_message_to_irc(&content) {
+                                    self.irc_sink.send(message?).await?;
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        let _ = dbg!(e);
+                        Err(e) => {
+                            let _ = dbg!(e);
+                        }
                     }
                 }
             }
+            _ => (),
         }
 
         Ok(())
     }
 
     async fn handle(mut self) -> Result<()> {
+        self.chat_client
+            .list_users()
+            .await?
+            .into_iter()
+            .for_each(|u| {
+                self.users.insert(u.id, u.username);
+            });
+
         while let Some(item) = self.event_stream.next().await {
             match item? {
                 Event::Irc(irc_message) => {
@@ -499,9 +555,7 @@ where
                     .await?;
             }
             Command::WHO(Some(mask), _) => {
-                if mask.eq_ignore_ascii_case(&self.nick)
-                    || mask.eq_ignore_ascii_case("#blanket-fort")
-                {
+                if mask.eq_ignore_ascii_case(&self.nick) {
                     self.irc_sink
                         .feed(create_response(
                             Response::RPL_WHOREPLY,
@@ -518,6 +572,33 @@ where
                             ],
                         ))
                         .await?;
+                    self.irc_sink
+                        .feed(create_response(
+                            Response::RPL_ENDOFWHO,
+                            self.nick.clone(),
+                            vec![mask, "End of WHO list".to_string()],
+                        ))
+                        .await?;
+                } else if mask.eq_ignore_ascii_case("#blanket-fort") {
+                    let users = self.users_list();
+                    for user in users {
+                        self.irc_sink
+                            .feed(create_response(
+                                Response::RPL_WHOREPLY,
+                                self.nick.clone(),
+                                vec![
+                                    "#blanket-fort".to_string(),
+                                    user.clone(),
+                                    user.clone(),
+                                    "localhost".to_string(),
+                                    user.clone(),
+                                    "H".to_string(),
+                                    0.to_string(),
+                                    user.clone(),
+                                ],
+                            ))
+                            .await?;
+                    }
                     self.irc_sink
                         .feed(create_response(
                             Response::RPL_ENDOFWHO,
@@ -564,6 +645,37 @@ where
                 //         vec!["You may not reregister".to_string()],
                 //     ))
                 //     .await?;
+            }
+            Command::ChannelMODE(channel, modes) => {
+                if !channel.eq_ignore_ascii_case("#blanket-fort") {
+                    self.irc_sink
+                        .feed(create_response(
+                            Response::ERR_NOSUCHCHANNEL,
+                            self.nick.clone(),
+                            vec![channel, "No such channel".to_string()],
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+
+                if !modes.is_empty() {
+                    self.irc_sink
+                        .feed(create_response(
+                            Response::ERR_CHANOPRIVSNEEDED,
+                            self.nick.clone(),
+                            vec![channel, "You're not channel operator".to_string()],
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+
+                self.irc_sink
+                    .feed(create_response(
+                        Response::RPL_CHANNELMODEIS,
+                        self.nick.clone(),
+                        vec![channel, "+b".to_string()],
+                    ))
+                    .await?;
             }
             Command::PING(..) => unreachable!(),
             Command::QUIT(..) => unreachable!(),
@@ -678,7 +790,8 @@ fn create_event_stream(
     irc_stream: impl Stream<Item = Result<Message, ProtocolError>>,
 ) -> impl Stream<Item = Result<Event>> {
     let irc_stream = irc_stream.map(|m| m.map(Event::Irc).map_err(Into::into));
-    let message_bus = MessageBus::new(chat_client, &["/chat/4"]).map(|m| m.map(Event::MessageBus));
+    let message_bus = MessageBus::new(chat_client, &["/chat/4", "/presence/chat/online"])
+        .map(|m| m.map(Event::MessageBus));
 
     tokio_stream::StreamExt::merge(irc_stream, message_bus)
 }
