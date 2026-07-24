@@ -683,6 +683,24 @@ where
                     ))
                     .await?;
             }
+            Command::USERHOST(nicks) => {
+                let users_list = self.users_list();
+                // TODO: I really gotta get rid of this bad habit
+                let replies = nicks
+                    .into_iter()
+                    .filter(|n| users_list.iter().any(|u| u.eq_ignore_ascii_case(n)))
+                    .map(|n| format!("{n}=+{n}@blanket-fort"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                self.irc_sink
+                    .feed(create_response(
+                        Response::RPL_USERHOST,
+                        self.nick.clone(),
+                        vec![replies],
+                    ))
+                    .await?;
+            }
             Command::PING(..) => unreachable!(),
             Command::QUIT(..) => unreachable!(),
             other => {
