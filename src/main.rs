@@ -290,14 +290,14 @@ where
 
     async fn send_names(&mut self, channel: String) -> Result<()> {
         if channel.eq_ignore_ascii_case("#blanket-fort") {
-            let users = self.users_list();
-            let arguments = vec!["=".to_string(), channel.clone()];
+            let users = self.users_list().join(" ");
+            let arguments = vec!["=".to_string(), channel.clone(), users];
 
             self.irc_sink
                 .feed(create_response(
                     Response::RPL_NAMREPLY,
                     self.nick.clone(),
-                    [arguments, users].concat(),
+                    arguments,
                 ))
                 .await?;
 
@@ -595,12 +595,11 @@ where
                                 vec![
                                     "#blanket-fort".to_string(),
                                     user.clone(),
-                                    user.clone(),
+                                    "blanket-fort".to_string(),
                                     "localhost".to_string(),
                                     user.clone(),
                                     "H".to_string(),
-                                    0.to_string(),
-                                    user.clone(),
+                                    format!("0 {user}"),
                                 ],
                             ))
                             .await?;
