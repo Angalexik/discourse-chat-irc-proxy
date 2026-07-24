@@ -12,8 +12,14 @@ use irc::proto::{
 #[allow(unused_imports)]
 use reqwest::Proxy;
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, collections::HashMap, num::NonZeroU8, rc::Rc, str::FromStr};
-use strum::{EnumString, IntoStaticStr};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    num::NonZeroU8,
+    rc::Rc,
+    str::FromStr,
+};
+use strum::{EnumString, IntoStaticStr, VariantNames};
 use time::format_description::well_known::{Iso8601, iso8601};
 use tokio::{net::TcpListener, task};
 use tokio_util::codec::Decoder;
@@ -141,7 +147,7 @@ enum Event {
     MessageBus(MessageBusMessage),
 }
 
-#[derive(Clone, Copy, EnumString, IntoStaticStr, PartialEq, Eq)]
+#[derive(Clone, Copy, EnumString, IntoStaticStr, VariantNames, PartialEq, Eq, Hash)]
 #[strum(serialize_all = "kebab-case")]
 enum Capability {
     ServerTime,
@@ -173,7 +179,7 @@ struct Connection<Si, St> {
     chat_client: ChatClient,
     users: HashMap<i64, String>,
     connection_state: ConnectionState,
-    capabilities: Vec<Capability>,
+    capabilities: HashSet<Capability>,
 }
 
 impl<Si, St> Connection<Si, St>
@@ -190,7 +196,7 @@ where
             chat_client,
             users: HashMap::new(),
             connection_state: ConnectionState::Initial,
-            capabilities: Vec::new(),
+            capabilities: HashSet::new(),
         }
     }
 
@@ -316,7 +322,7 @@ where
     }
 
     async fn handle_irc(&mut self, irc_message: Message) -> Result<bool> {
-        dbg!(&irc_message, &self.users);
+        // dbg!(&irc_message, &self.users);
         match irc_message.command {
             Command::PING(x, y) => {
                 self.irc_sink
@@ -711,13 +717,9 @@ where
             "*"
         };
 
-        fn cap_response<'a>(
-            subcommand: &'a str,
-            nick: &'a str,
-            mut parameters: Vec<&'a str>,
-        ) -> Message {
+        fn cap_response<'a>(subcommand: &'a str, nick: &'a str, parameters: &[&'a str]) -> Message {
             let mut args = vec![nick, subcommand];
-            args.append(&mut parameters);
+            args.extend_from_slice(parameters);
 
             Message::new(None, "CAP", args).unwrap()
         }
@@ -725,7 +727,7 @@ where
         match command {
             CapSubCommand::LS => {
                 self.irc_sink
-                    .feed(cap_response("LS", nick, vec!["server-time"]))
+                    .feed(cap_response("LS", nick, Capability::VARIANTS))
                     .await?
             }
             CapSubCommand::LIST => {
@@ -733,7 +735,7 @@ where
                     .feed(cap_response(
                         "LIST",
                         nick,
-                        self.capabilities.iter().map(Into::into).collect(),
+                        &self.capabilities.iter().map(Into::into).collect::<Vec<_>>(),
                     ))
                     .await?;
             }
@@ -755,24 +757,15 @@ where
                     })
                     .partition(|&(_, add)| add);
 
-                let mut add_extensions: Vec<_> =
-                    add_extensions.into_iter().map(|(c, _)| c).collect();
-
-                let remove_extensions: Vec<_> =
-                    remove_extensions.into_iter().map(|(c, _)| c).collect();
-
-                self.capabilities.append(&mut add_extensions);
-
-                // O(n^2) moment
-                self.capabilities = self
-                    .capabilities
-                    .iter()
-                    .copied()
-                    .filter(|c| !remove_extensions.contains(c))
-                    .collect();
+                for (cap, _) in add_extensions {
+                    self.capabilities.insert(cap);
+                }
+                for (cap, _) in &remove_extensions {
+                    self.capabilities.remove(cap);
+                }
 
                 self.irc_sink
-                    .feed(cap_response("ACK", nick, vec![&param]))
+                    .feed(cap_response("ACK", nick, &[&param]))
                     .await?;
             }
             CapSubCommand::ACK | CapSubCommand::NAK | CapSubCommand::NEW | CapSubCommand::DEL => {
