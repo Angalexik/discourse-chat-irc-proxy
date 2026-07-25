@@ -23,6 +23,7 @@ use strum::{EnumString, IntoStaticStr, VariantNames};
 use time::format_description::well_known::{Iso8601, iso8601};
 use tokio::{net::TcpListener, task};
 use tokio_util::codec::Decoder;
+use uuid::Uuid;
 
 use crate::discourse_chat::{ChatClient, ChatMessage, MessageBus, MessageBusMessage};
 
@@ -151,6 +152,8 @@ enum Event {
 #[strum(serialize_all = "kebab-case")]
 enum Capability {
     ServerTime,
+    Batch,
+    MessageTags,
 }
 
 #[derive(Default, Clone)]
@@ -238,50 +241,93 @@ where
 
         let backlog = self.chat_client.message_backlog().await?;
 
+        self.send_backlog(&backlog).await?;
+
+        Ok(())
+    }
+
+    async fn send_backlog(&mut self, backlog: &[ChatMessage]) -> Result<()> {
+        let batch_id = if self.capabilities.contains(&Capability::Batch) {
+            Some(Uuid::new_v4().to_string())
+        } else {
+            None
+        };
+        if let Some(ref batch_id) = batch_id {
+            self.irc_sink
+                .feed(Message::new(
+                    None,
+                    "BATCH",
+                    vec![&format!("+{batch_id}"), "chathistory", "#blanket-fort"],
+                )?)
+                .await?;
+        }
+
         for message in backlog
             .iter()
             .flat_map(|message| self.chat_message_to_irc(message))
             .collect::<Vec<_>>()
         {
-            self.irc_sink.feed(message?).await?;
+            let mut message = message;
+            if let Some(ref batch_id) = batch_id {
+                message
+                    .tags
+                    .get_or_insert_with(Vec::new)
+                    .push(Tag("batch".to_string(), Some(batch_id.to_owned())));
+            }
+
+            self.irc_sink.feed(message).await?;
+        }
+
+        if let Some(ref batch_id) = batch_id {
+            self.irc_sink
+                .feed(Message::new(None, "BATCH", vec![&format!("-{batch_id}")])?)
+                .await?;
         }
 
         Ok(())
     }
 
-    fn chat_message_to_irc(&self, message: &ChatMessage) -> Vec<Result<Message>> {
-        message
-            .text
-            .lines()
-            .map(|line| {
-                if self.capabilities.contains(&Capability::ServerTime) {
-                    Ok(Message::with_tags(
-                        Some(vec![Tag(
-                            "time".to_string(),
-                            Some(
-                                message
-                                    .timestamp
-                                    .format(&Iso8601::<ISO8601_CONFIG>)
-                                    .unwrap(),
-                            ),
-                        )]),
-                        Some(&message.sender),
-                        "PRIVMSG",
-                        vec!["#blanket-fort", line],
-                    )?)
-                } else {
-                    Ok(Message::new(
-                        Some(&message.sender),
-                        "PRIVMSG",
-                        vec!["#blanket-fort", line],
-                    )?)
-                }
-            })
-            .collect()
+    fn chat_message_to_irc(&self, message: &ChatMessage) -> Vec<Message> {
+        let transform = |(idx, line)| {
+            let mut basic_message = Message::new(
+                Some(&message.sender),
+                "PRIVMSG",
+                vec!["#blanket-fort", line],
+            )
+            .unwrap();
+
+            if self.capabilities.contains(&Capability::ServerTime)
+                || self.capabilities.contains(&Capability::MessageTags)
+            {
+                basic_message.tags.get_or_insert_with(Vec::new).push(Tag(
+                    "time".to_string(),
+                    Some(
+                        message
+                            .timestamp
+                            .format(&Iso8601::<ISO8601_CONFIG>)
+                            .unwrap(),
+                    ),
+                ));
+            }
+
+            if self.capabilities.contains(&Capability::MessageTags) {
+                basic_message.tags.get_or_insert_with(Vec::new).push(Tag(
+                    "msgid".to_string(),
+                    Some(if idx > 0 {
+                        format!("{0}_{1}", message.id, idx)
+                    } else {
+                        message.id.to_string()
+                    }),
+                ));
+            }
+
+            basic_message
+        };
+        message.text.lines().enumerate().map(transform).collect()
     }
 
     fn users_list(&self) -> Vec<String> {
-        let mut users: Vec<_> = self.users.values().cloned().collect();
+        let mut users: Vec<_> = dbg!(&self.users).values().cloned().collect();
         if !users.iter().any(|u| u.eq_ignore_ascii_case(&self.nick)) {
             users.push(self.nick.clone());
         }
@@ -322,7 +368,7 @@ where
     }
 
     async fn handle_irc(&mut self, irc_message: Message) -> Result<bool> {
-        // dbg!(&irc_message, &self.users);
+        dbg!(&irc_message);
         match irc_message.command {
             Command::PING(x, y) => {
                 self.irc_sink
@@ -402,7 +448,7 @@ where
                                 .contains(&content.id)
                             {
                                 for message in self.chat_message_to_irc(&content) {
-                                    self.irc_sink.send(message?).await?;
+                                    self.irc_sink.send(message).await?;
                                 }
                             }
                         }
@@ -504,6 +550,7 @@ where
         irc_message: Message,
         registered_state: &mut RegisteredState,
     ) -> Result<()> {
+        let tags = irc_message.tags.unwrap_or_default();
         match irc_message.command {
             Command::PRIVMSG(target, text) => {
                 if target == "#blanket-fort" {
@@ -551,6 +598,7 @@ where
                         .await?;
                 }
             }
+            Command::Raw(command, args) if command.eq_ignore_ascii_case("TAGMSG") => {}
             Command::WHO(None, _) => {
                 self.irc_sink
                     .feed(create_response(
@@ -632,6 +680,9 @@ where
             }
             Command::NAMES(Some(channel), _) => {
                 self.send_names(channel).await?;
+            }
+            Command::CAP(nick, command, param, idk) => {
+                self.cap_command(nick, command, param, idk).await?;
             }
             Command::NICK(new_nick) => {
                 self.irc_sink
@@ -736,7 +787,9 @@ where
 
         fn cap_response<'a>(subcommand: &'a str, nick: &'a str, parameters: &[&'a str]) -> Message {
             let mut args = vec![nick, subcommand];
-            args.extend_from_slice(parameters);
+            let caps_arg = parameters.join(" ");
+            args.push(&caps_arg);
+            // args.extend_from_slice(parameters);
 
             Message::new(None, "CAP", args).unwrap()
         }
