@@ -154,6 +154,7 @@ enum Capability {
     ServerTime,
     Batch,
     MessageTags,
+    EchoMessage,
 }
 
 #[derive(Default, Clone)]
@@ -442,10 +443,11 @@ where
                     let content = message.deserialize_chat_message();
                     match content {
                         Ok(content) => {
-                            if !registered_state
-                                .ignore_message_ids
-                                .borrow()
-                                .contains(&content.id)
+                            if self.capabilities.contains(&Capability::EchoMessage)
+                                || !registered_state
+                                    .ignore_message_ids
+                                    .borrow()
+                                    .contains(&content.id)
                             {
                                 for message in self.chat_message_to_irc(&content) {
                                     self.irc_sink.send(message).await?;
