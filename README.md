@@ -41,6 +41,7 @@ After configuring the config file and restarting the server, you may use any IRC
 - Sending messages
 - User list
 - Accurate timestamps for messages in the backlog
+- `JOIN` and `PART` sent to the client as users enter and exit the chatroom
 
 ### Unimplemented
 
@@ -48,6 +49,5 @@ After configuring the config file and restarting the server, you may use any IRC
 - Message reactions
 - Message edits
 - Message deletions
-- `JOIN` and `PART` sent to the client as users enter and exit the chatroom
 - Graceful error handling
 - Approximately 80% of the required IRC server spec (none of the clients I've tested seem to mind, though)
