@@ -34,12 +34,18 @@ pub struct DiscourseUser {
     pub username: String,
     pub id: i64,
 }
+
+#[derive(Deserialize, Debug)]
+struct DiscourseRepliedToMessage {
+    id: i64,
+}
 #[derive(Deserialize, Debug)]
 struct DiscourseMessage {
     message: String,
     user: DiscourseUser,
     id: i64,
     created_at: String,
+    in_reply_to: Option<DiscourseRepliedToMessage>,
 }
 
 #[allow(dead_code)]
@@ -257,6 +263,7 @@ pub struct ChatMessage {
     pub sender: String,
     pub timestamp: UtcDateTime,
     pub id: i64,
+    pub replying_to: Option<i64>,
 }
 
 impl From<&DiscourseMessage> for ChatMessage {
@@ -266,6 +273,7 @@ impl From<&DiscourseMessage> for ChatMessage {
             sender: value.user.username.clone(),
             id: value.id,
             timestamp: UtcDateTime::parse(&value.created_at, &Rfc3339).unwrap(),
+            replying_to: value.in_reply_to.as_ref().map(|m| m.id),
         }
     }
 }
@@ -346,7 +354,7 @@ impl ChatClient {
         Ok(messages.iter().map(|m| m.into()).collect())
     }
 
-    pub async fn send_message(&self, text: &str) -> Result<i64> {
+    pub async fn send_message(&self, text: &str, replying_to: Option<i64>) -> Result<i64> {
         #[derive(Deserialize)]
         struct ApiResponse {
             success: String,
@@ -532,7 +540,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            chat_client.send_message("test-message").await.unwrap(),
+            chat_client.send_message("test-message", None).await.unwrap(),
             message_id
         );
         message_mock.assert();

@@ -312,7 +312,8 @@ where
             }
 
             if self.capabilities.contains(&Capability::MessageTags) {
-                basic_message.tags.get_or_insert_with(Vec::new).push(Tag(
+                let mut extra_tags = Vec::new();
+                extra_tags.push(Tag(
                     "msgid".to_string(),
                     Some(if idx > 0 {
                         format!("{0}_{1}", message.id, idx)
@@ -320,6 +321,15 @@ where
                         message.id.to_string()
                     }),
                 ));
+
+                if let Some(reply_id) = message.replying_to {
+                    extra_tags.push(Tag("+reply".to_string(), Some(reply_id.to_string())));
+                }
+
+                basic_message
+                    .tags
+                    .get_or_insert_with(Vec::new)
+                    .append(&mut extra_tags);
             }
 
             basic_message
@@ -556,7 +566,11 @@ where
         match irc_message.command {
             Command::PRIVMSG(target, text) => {
                 if target == "#blanket-fort" {
-                    let message_id = self.chat_client.send_message(&text).await?;
+                    let reply_id = tags
+                        .iter()
+                        .find(|t| t.0.eq_ignore_ascii_case("+reply"))
+                        .and_then(|t| t.1.as_ref().and_then(|id| id.parse::<i64>().ok()));
+                    let message_id = self.chat_client.send_message(&text, reply_id).await?;
                     registered_state
                         .ignore_message_ids
                         .borrow_mut()
