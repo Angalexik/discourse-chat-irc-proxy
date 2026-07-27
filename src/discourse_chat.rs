@@ -48,6 +48,31 @@ struct DiscourseMessage {
     in_reply_to: Option<DiscourseRepliedToMessage>,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum AddOrRemove {
+    Add,
+    Remove,
+}
+
+#[derive(Deserialize, Debug)]
+struct DiscourseReact {
+    action: AddOrRemove,
+    user: DiscourseUser,
+    emoji: String,
+    chat_message_id: i64,
+}
+
+pub enum MessageBusChat {
+    Message(ChatMessage),
+    Reaction {
+        sender: String,
+        reaction_to: i64,
+        action: AddOrRemove,
+        emoji_name: String,
+    },
+}
+
 #[allow(dead_code)]
 #[derive(Deserialize, Serialize, Clone)]
 pub struct MessageBusMessage {
@@ -58,24 +83,26 @@ pub struct MessageBusMessage {
 }
 
 impl MessageBusMessage {
-    pub fn deserialize_chat_message(self) -> Result<ChatMessage> {
+    pub fn deserialize_chat(self) -> Result<MessageBusChat> {
         #[derive(Deserialize, Debug)]
         #[serde(tag = "type")]
         #[serde(rename_all = "lowercase")]
         enum Data {
             Sent { chat_message: DiscourseMessage },
+            Reaction(DiscourseReact),
         }
 
         let deserialized = serde_json::from_value::<Data>(self.data)?;
 
-        if let Data::Sent { chat_message } = deserialized {
-            Ok((&chat_message).into())
-        } else {
-            Err(eyre!(
-                "Expected variant Data::Sent, instead got {:?}",
-                deserialized
-            ))
-        }
+        Ok(match deserialized {
+            Data::Sent { chat_message } => MessageBusChat::Message(chat_message.into()),
+            Data::Reaction(reaction) => MessageBusChat::Reaction {
+                sender: reaction.user.username,
+                reaction_to: reaction.chat_message_id,
+                action: reaction.action,
+                emoji_name: reaction.emoji,
+            },
+        })
     }
 
     pub fn deserialize_presence(self) -> (Vec<DiscourseUser>, Vec<i64>) {
@@ -540,7 +567,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            chat_client.send_message("test-message", None).await.unwrap(),
+            chat_client
+                .send_message("test-message", None)
+                .await
+                .unwrap(),
             message_id
         );
         message_mock.assert();

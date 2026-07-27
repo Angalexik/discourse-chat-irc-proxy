@@ -1,4 +1,5 @@
 mod discourse_chat;
+mod emoji;
 
 use color_eyre::eyre::{Context as _, OptionExt, Result, eyre};
 use futures::{Sink, Stream, StreamExt, sink::SinkExt};
@@ -27,8 +28,12 @@ use tokio_stream::{StreamMap, wrappers::IntervalStream};
 use tokio_util::codec::Decoder;
 use uuid::Uuid;
 
-use crate::discourse_chat::{
-    ChatClient, ChatMessage, DiscourseUser, MessageBus, MessageBusMessage,
+use crate::{
+    discourse_chat::{
+        AddOrRemove::{Add, Remove},
+        ChatClient, ChatMessage, DiscourseUser, MessageBus, MessageBusChat, MessageBusMessage,
+    },
+    emoji::name_to_emoji,
 };
 
 const ISO8601_CONFIG: iso8601::EncodedConfig = iso8601::Config::DEFAULT
@@ -345,7 +350,7 @@ where
     }
 
     fn users_list(&self) -> Vec<String> {
-        let mut users: Vec<_> = dbg!(&self.users).values().cloned().collect();
+        let mut users: Vec<_> = self.users.values().cloned().collect();
         if !users.iter().any(|u| u.eq_ignore_ascii_case(&self.nick)) {
             users.push(self.nick.clone());
         }
@@ -386,7 +391,7 @@ where
     }
 
     async fn handle_irc(&mut self, irc_message: Message) -> Result<bool> {
-        dbg!(&irc_message);
+        // dbg!(&irc_message);
         match irc_message.command {
             Command::PING(x, y) => {
                 self.irc_sink
@@ -498,9 +503,9 @@ where
             }
             "/chat/4" => {
                 if let ConnectionState::Registered(registered_state) = &self.connection_state {
-                    let content = message.deserialize_chat_message();
+                    let content = message.deserialize_chat();
                     match content {
-                        Ok(content) => {
+                        Ok(MessageBusChat::Message(content)) => {
                             if self.capabilities.contains(&Capability::EchoMessage)
                                 || !registered_state
                                     .ignore_message_ids
@@ -510,6 +515,39 @@ where
                                 for message in self.chat_message_to_irc(&content) {
                                     self.irc_sink.send(message).await?;
                                 }
+                            }
+                        }
+                        Ok(MessageBusChat::Reaction {
+                            sender,
+                            reaction_to,
+                            action,
+                            emoji_name,
+                        }) => {
+                            if self.capabilities.contains(&Capability::MessageTags) {
+                                self.irc_sink
+                                    .send(Message::with_tags(
+                                        Some(vec![
+                                            Tag(
+                                                "+reply".to_string(),
+                                                Some(reaction_to.to_string()),
+                                            ),
+                                            Tag(
+                                                match action {
+                                                    Add => "+draft/react".to_string(),
+                                                    Remove => "+draft/unreact".to_string(),
+                                                },
+                                                Some(
+                                                    name_to_emoji(&emoji_name)
+                                                        .ok_or_eyre("Emoji name not found")?
+                                                        .to_string(),
+                                                ),
+                                            ),
+                                        ]),
+                                        Some(&sender),
+                                        "TAGMSG",
+                                        vec!["#blanket-fort"],
+                                    )?)
+                                    .await?
                             }
                         }
                         Err(e) => {

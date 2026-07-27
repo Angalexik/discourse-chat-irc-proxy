@@ -43,11 +43,12 @@ After configuring the config file and restarting the server, you may use any IRC
 - Accurate timestamps for messages in the backlog
 - `JOIN` and `PART` sent to the client as users enter and exit the chatroom
 - Receiving message replies
+- Receiving message reactions
 
 ### Unimplemented
 
 - Sending message replies
-- Message reactions
+- Sending message reactions
 - Message edits
 - Message deletions
 - Graceful error handling
