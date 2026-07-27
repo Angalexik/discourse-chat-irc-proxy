@@ -18,10 +18,12 @@ use std::{
     num::NonZeroU8,
     rc::Rc,
     str::FromStr,
+    time::Duration,
 };
 use strum::{EnumString, IntoStaticStr, VariantNames};
 use time::format_description::well_known::{Iso8601, iso8601};
-use tokio::{net::TcpListener, task};
+use tokio::{net::TcpListener, task, time::interval};
+use tokio_stream::{StreamMap, wrappers::IntervalStream};
 use tokio_util::codec::Decoder;
 use uuid::Uuid;
 
@@ -146,6 +148,7 @@ fn create_response(response: Response, client: String, arguments: Vec<String>) -
 enum Event {
     Irc(Message),
     MessageBus(MessageBusMessage),
+    SendTypingInterval,
 }
 
 #[derive(Clone, Copy, EnumString, IntoStaticStr, VariantNames, PartialEq, Eq, Hash)]
@@ -182,6 +185,7 @@ struct Connection<Si, St> {
     event_stream: St,
     chat_client: ChatClient,
     users: HashMap<i64, String>,
+    users_typing: HashMap<i64, String>,
     connection_state: ConnectionState,
     capabilities: HashSet<Capability>,
 }
@@ -199,6 +203,7 @@ where
             event_stream,
             chat_client,
             users: HashMap::new(),
+            users_typing: HashMap::new(),
             connection_state: ConnectionState::Initial,
             capabilities: HashSet::new(),
         }
@@ -448,6 +453,27 @@ where
 
                 self.irc_sink.flush().await?;
             }
+            "/presence/chat-reply/4" if self.capabilities.contains(&Capability::MessageTags) => {
+                let (entering, leaving) = message.deserialize_presence();
+
+                for u in entering {
+                    if self.users_typing.insert(u.id, u.username.clone()).is_none()
+                        && matches!(self.connection_state, ConnectionState::Registered(_))
+                    {
+                        self.send_typing(&u.username, true).await?;
+                    }
+                }
+
+                for id in leaving {
+                    if let Some(username) = self.users_typing.remove(&id)
+                        && matches!(self.connection_state, ConnectionState::Registered(_))
+                    {
+                        self.send_typing(&username, false).await?;
+                    }
+                }
+
+                self.irc_sink.flush().await?;
+            }
             "/chat/4" => {
                 if let ConnectionState::Registered(registered_state) = &self.connection_state {
                     let content = message.deserialize_chat_message();
@@ -494,6 +520,9 @@ where
                 }
                 Event::MessageBus(message) => {
                     self.handle_messagebus(message).await?;
+                }
+                Event::SendTypingInterval => {
+                    self.handle_typing_interval().await?;
                 }
             }
         }
@@ -862,17 +891,55 @@ where
 
         Ok(())
     }
+
+    async fn send_typing(&mut self, username: &str, active: bool) -> Result<()> {
+        let state = if active { "active" } else { "paused" };
+        self.irc_sink
+            .feed(Message::with_tags(
+                Some(vec![Tag("+typing".to_string(), Some(state.to_string()))]),
+                Some(username),
+                "TAGMSG",
+                vec!["#blanket-fort"],
+            )?)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn handle_typing_interval(&mut self) -> Result<()> {
+        for username in self.users_typing.clone().values() {
+            self.send_typing(username, true).await?;
+        }
+
+        self.irc_sink.flush().await?;
+
+        Ok(())
+    }
 }
 
 fn create_event_stream(
     chat_client: ChatClient,
-    irc_stream: impl Stream<Item = Result<Message, ProtocolError>>,
+    irc_stream: impl Stream<Item = Result<Message, ProtocolError>> + 'static,
 ) -> impl Stream<Item = Result<Event>> {
-    let irc_stream = irc_stream.map(|m| m.map(Event::Irc).map_err(Into::into));
-    let message_bus = MessageBus::new(chat_client, &["/chat/4", "/presence/chat/online"])
-        .map(|m| m.map(Event::MessageBus));
+    let mut map = StreamMap::new();
+    let irc_stream = irc_stream
+        .map(|m| m.map(Event::Irc).map_err(Into::into))
+        .boxed_local();
+    let message_bus = MessageBus::new(
+        chat_client,
+        &["/chat/4", "/presence/chat/online", "/presence/chat-reply/4"],
+    )
+    .map(|m| m.map(Event::MessageBus))
+    .boxed_local();
+    let interval_stream = IntervalStream::new(interval(Duration::from_secs(4)))
+        .map(|_| Ok(Event::SendTypingInterval))
+        .boxed_local();
 
-    tokio_stream::StreamExt::merge(irc_stream, message_bus)
+    map.insert(0, irc_stream);
+    map.insert(1, message_bus);
+    map.insert(2, interval_stream);
+
+    map.map(|(_, e)| e)
 }
 
 #[tokio::main(flavor = "local")]
