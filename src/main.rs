@@ -27,7 +27,9 @@ use tokio_stream::{StreamMap, wrappers::IntervalStream};
 use tokio_util::codec::Decoder;
 use uuid::Uuid;
 
-use crate::discourse_chat::{ChatClient, ChatMessage, MessageBus, MessageBusMessage};
+use crate::discourse_chat::{
+    ChatClient, ChatMessage, DiscourseUser, MessageBus, MessageBusMessage,
+};
 
 const ISO8601_CONFIG: iso8601::EncodedConfig = iso8601::Config::DEFAULT
     .set_time_precision(iso8601::TimePrecision::Second {
@@ -414,21 +416,43 @@ where
         Ok(false)
     }
 
+    fn modify_presence_and_diff(
+        map: &mut HashMap<i64, String>,
+        presence: (Vec<DiscourseUser>, Vec<i64>),
+    ) -> (Vec<String>, Vec<String>) {
+        let (entering, leaving) = presence;
+
+        let entering = entering
+            .into_iter()
+            .filter_map(|u| {
+                if map.insert(u.id, u.username.clone()).is_none() {
+                    Some(u.username)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let leaving = leaving.iter().filter_map(|id| map.remove(id)).collect();
+
+        (entering, leaving)
+    }
+
     async fn handle_messagebus(&mut self, message: MessageBusMessage) -> Result<()> {
         match message.channel.as_str() {
             "/presence/chat/online" => {
-                let (entering, leaving) = message.deserialize_presence();
+                let (entering, leaving) =
+                    Self::modify_presence_and_diff(&mut self.users, message.deserialize_presence());
 
                 // TODO: Make the display of JOIN and PART messages configurable, since some clients
                 // show them in quite a distracting way
-                for u in entering {
-                    if self.users.insert(u.id, u.username.clone()).is_none()
-                        && !u.username.eq_ignore_ascii_case(&self.nick)
+                for username in entering {
+                    if !username.eq_ignore_ascii_case(&self.nick)
                         && matches!(self.connection_state, ConnectionState::Registered(_))
                     {
                         self.irc_sink
                             .feed(Message::new(
-                                Some(&u.username),
+                                Some(&username),
                                 "JOIN",
                                 vec!["#blanket-fort"],
                             )?)
@@ -436,9 +460,8 @@ where
                     }
                 }
 
-                for id in leaving {
-                    if let Some(username) = self.users.remove(&id)
-                        && !username.eq_ignore_ascii_case(&self.nick)
+                for username in leaving {
+                    if !username.eq_ignore_ascii_case(&self.nick)
                         && matches!(self.connection_state, ConnectionState::Registered(_))
                     {
                         self.irc_sink
@@ -454,20 +477,19 @@ where
                 self.irc_sink.flush().await?;
             }
             "/presence/chat-reply/4" if self.capabilities.contains(&Capability::MessageTags) => {
-                let (entering, leaving) = message.deserialize_presence();
+                let (entering, leaving) = Self::modify_presence_and_diff(
+                    &mut self.users_typing,
+                    message.deserialize_presence(),
+                );
 
-                for u in entering {
-                    if self.users_typing.insert(u.id, u.username.clone()).is_none()
-                        && matches!(self.connection_state, ConnectionState::Registered(_))
-                    {
-                        self.send_typing(&u.username, true).await?;
+                for username in entering {
+                    if matches!(self.connection_state, ConnectionState::Registered(_)) {
+                        self.send_typing(&username, true).await?;
                     }
                 }
 
-                for id in leaving {
-                    if let Some(username) = self.users_typing.remove(&id)
-                        && matches!(self.connection_state, ConnectionState::Registered(_))
-                    {
+                for username in leaving {
+                    if matches!(self.connection_state, ConnectionState::Registered(_)) {
                         self.send_typing(&username, false).await?;
                     }
                 }
