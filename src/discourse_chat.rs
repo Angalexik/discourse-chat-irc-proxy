@@ -394,9 +394,13 @@ impl ChatClient {
             .post(self.base_url.join("/chat/4")?)
             .headers(self.headers.clone())
             .form(&[
-                ("message", text),
-                ("staged_id", &Uuid::new_v4().to_string()),
-                ("client_created_at", &timestamp),
+                ("message", Some(text)),
+                ("staged_id", Some(&Uuid::new_v4().to_string())),
+                ("client_created_at", Some(&timestamp)),
+                (
+                    "in_reply_to_id",
+                    replying_to.map(|i| i.to_string()).as_deref(),
+                ),
             ])
             .send()
             .await?
@@ -556,7 +560,8 @@ mod tests {
                 .cookie("_forum_session", MockLogin::SESSION_COOKIE)
                 .form_urlencoded_tuple("message", "test-message")
                 .form_urlencoded_tuple_exists("staged_id")
-                .form_urlencoded_tuple_exists("client_created_at");
+                .form_urlencoded_tuple_exists("client_created_at")
+                .form_urlencoded_tuple_missing("in_reply_to_id");
             then.status(200)
                 .json_body(json!({ "success": "OK", "message_id": 2 }));
         });
@@ -569,6 +574,42 @@ mod tests {
         assert_eq!(
             chat_client
                 .send_message("test-message", None)
+                .await
+                .unwrap(),
+            message_id
+        );
+        message_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_reply() {
+        let server = MockServer::start();
+        let _mock = MockLogin::mock(&server);
+
+        let message_id = 2;
+
+        let message_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/4")
+                .header("X-CSRF-Token", MockLogin::CSRF_TOKEN)
+                .header("X-Requested-With", "XMLHttpRequest")
+                .cookie("_forum_session", MockLogin::SESSION_COOKIE)
+                .form_urlencoded_tuple("message", "test-message")
+                .form_urlencoded_tuple_exists("staged_id")
+                .form_urlencoded_tuple_exists("client_created_at")
+                .form_urlencoded_tuple("in_reply_to_id", "1");
+            then.status(200)
+                .json_body(json!({ "success": "OK", "message_id": 2 }));
+        });
+
+        let url: Url = server.base_url().as_str().try_into().unwrap();
+        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            chat_client
+                .send_message("test-message", Some(1))
                 .await
                 .unwrap(),
             message_id
