@@ -1,4 +1,5 @@
-use color_eyre::eyre::{OptionExt, Result, eyre};
+use color_eyre::eyre::{Context, OptionExt, Result, eyre};
+use core::task;
 use futures::{
     FutureExt, Stream, StreamExt,
     future::LocalBoxFuture,
@@ -14,7 +15,7 @@ use std::pin::pin;
 use std::{
     collections::HashMap,
     pin::Pin,
-    task::{Context, Poll, ready},
+    task::{Poll, ready},
 };
 use time::{
     UtcDateTime,
@@ -248,7 +249,7 @@ impl MessageBus<'_> {
 impl Stream for MessageBus<'_> {
     type Item = Result<MessageBusMessage>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.as_mut().project();
 
         match this.state.as_mut().project() {
@@ -264,7 +265,7 @@ impl Stream for MessageBus<'_> {
                     {
                         *entry = *message_id;
                     }
-                    return Poll::Ready(Some(message.map_err(Into::into)));
+                    return Poll::Ready(Some(message.wrap_err("Getting MessageBus message")));
                 }
 
                 this.inner.sequence_number += 1;

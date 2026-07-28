@@ -253,7 +253,11 @@ where
 
         self.send_names("#blanket-fort".to_string()).await?;
 
-        let backlog = self.chat_client.message_backlog().await?;
+        let backlog = self
+            .chat_client
+            .message_backlog()
+            .await
+            .wrap_err("Getting message backlog")?;
 
         self.send_backlog(&backlog).await?;
 
@@ -668,7 +672,11 @@ where
                                 .parse::<i64>()
                                 .ok()
                         });
-                    let message_id = self.chat_client.send_message(&text, reply_id).await?;
+                    let message_id = self
+                        .chat_client
+                        .send_message(&text, reply_id)
+                        .await
+                        .wrap_err("Sending message")?;
                     registered_state
                         .ignore_message_ids
                         .borrow_mut()
