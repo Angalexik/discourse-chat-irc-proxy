@@ -663,15 +663,7 @@ where
                     let reply_id = tags
                         .iter()
                         .find(|t| t.0.eq_ignore_ascii_case("+reply"))
-                        .and_then(|t| {
-                            let id = t.1.as_ref()?;
-                            regex!(r"(\d+)(_\d+)?")
-                                .captures(id)?
-                                .get(1)?
-                                .as_str()
-                                .parse::<i64>()
-                                .ok()
-                        });
+                        .and_then(|t| parse_reply_id(t.1.as_ref()?).ok());
                     let message_id = self
                         .chat_client
                         .send_message(&text, reply_id)
@@ -994,6 +986,15 @@ where
     }
 }
 
+fn parse_reply_id(content: &str) -> Result<i64> {
+    Ok(regex!(r"(\d+)(_\d+)?")
+        .captures(content)
+        .and_then(|capture| capture.get(1))
+        .ok_or_eyre("Error parsing reply id")?
+        .as_str()
+        .parse::<i64>()?)
+}
+
 fn create_event_stream(
     chat_client: ChatClient,
     irc_stream: impl Stream<Item = Result<Message, ProtocolError>> + 'static,
@@ -1046,5 +1047,16 @@ async fn main() -> Result<()> {
                 eprintln!("{e:?}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_reply_id;
+
+    #[test]
+    fn test_parse_reply() {
+        assert_eq!(parse_reply_id("1234").unwrap(), 1234);
+        assert_eq!(parse_reply_id("4567_1").unwrap(), 4567);
     }
 }
