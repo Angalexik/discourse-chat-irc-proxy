@@ -17,6 +17,7 @@ use std::{
     pin::Pin,
     task::{Poll, ready},
 };
+use strum::{EnumString, IntoStaticStr};
 use time::{
     UtcDateTime,
     format_description::well_known::{Iso8601, Rfc3339},
@@ -49,8 +50,9 @@ struct DiscourseMessage {
     in_reply_to: Option<DiscourseRepliedToMessage>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, EnumString, IntoStaticStr)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum AddOrRemove {
     Add,
     Remove,
@@ -417,6 +419,52 @@ impl ChatClient {
         }
     }
 
+    async fn send_react_common(
+        &self,
+        emoji_name: &str,
+        replying_to: i64,
+        add_or_remove: AddOrRemove,
+    ) -> Result<()> {
+        #[derive(Deserialize)]
+        struct ApiResponse {
+            success: String,
+        }
+
+        let response = self
+            .client
+            .put(
+                self.base_url
+                    .join(&format!("/chat/4/react/{replying_to}"))?,
+            )
+            .headers(self.headers.clone())
+            .form(&[
+                ("emoji", emoji_name),
+                ("react_action", add_or_remove.into()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ApiResponse>()
+            .await?;
+
+        let status = response.success;
+        if status == "OK" {
+            Ok(())
+        } else {
+            Err(eyre!("expected status `OK`, instead received `{status}`"))
+        }
+    }
+
+    pub async fn send_react(&self, emoji_name: &str, replying_to: i64) -> Result<()> {
+        self.send_react_common(emoji_name, replying_to, AddOrRemove::Add)
+            .await
+    }
+
+    pub async fn send_unreact(&self, emoji_name: &str, replying_to: i64) -> Result<()> {
+        self.send_react_common(emoji_name, replying_to, AddOrRemove::Remove)
+            .await
+    }
+
     pub async fn list_users(&self) -> Result<Vec<DiscourseUser>> {
         #[derive(Deserialize)]
         struct GlobalPresenceChannelState {
@@ -616,5 +664,47 @@ mod tests {
             message_id
         );
         message_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_react_unreact() {
+        let server = MockServer::start();
+        let _mock = MockLogin::mock(&server);
+
+        let message_id = 2;
+        let emoji = "distorted_face";
+
+        let react_mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path(format!("/chat/4/react/{message_id}"))
+                .header("X-CSRF-Token", MockLogin::CSRF_TOKEN)
+                .header("X-Requested-With", "XMLHttpRequest")
+                .cookie("_forum_session", MockLogin::SESSION_COOKIE)
+                .form_urlencoded_tuple("emoji", emoji)
+                .form_urlencoded_tuple("react_action", "add");
+            then.status(200).json_body(json!({ "success": "OK" }));
+        });
+
+        let unreact_mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path(format!("/chat/4/react/{message_id}"))
+                .header("X-CSRF-Token", MockLogin::CSRF_TOKEN)
+                .header("X-Requested-With", "XMLHttpRequest")
+                .cookie("_forum_session", MockLogin::SESSION_COOKIE)
+                .form_urlencoded_tuple("emoji", emoji)
+                .form_urlencoded_tuple("react_action", "remove");
+            then.status(200).json_body(json!({ "success": "OK" }));
+        });
+
+        let url: Url = server.base_url().as_str().try_into().unwrap();
+        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
+            .await
+            .unwrap();
+
+        chat_client.send_react(emoji, message_id).await.unwrap();
+        chat_client.send_unreact(emoji, message_id).await.unwrap();
+
+        react_mock.assert();
+        unreact_mock.assert();
     }
 }

@@ -34,7 +34,7 @@ use crate::{
         AddOrRemove::{Add, Remove},
         ChatClient, ChatMessage, DiscourseUser, MessageBus, MessageBusChat, MessageBusMessage,
     },
-    emoji::name_to_emoji,
+    emoji::{emoji_to_name, name_to_emoji},
 };
 
 const ISO8601_CONFIG: iso8601::EncodedConfig = iso8601::Config::DEFAULT
@@ -690,6 +690,46 @@ where
                         .await?;
                 }
             }
+            Command::Raw(command, args) if command.eq_ignore_ascii_case("TAGMSG") => {
+                let channel = args.first().ok_or_eyre("No target in tagmsg")?;
+                if channel == "#blanket-fort" {
+                    if let Some(react_tag) = tags.iter().find(|t| {
+                        t.0.eq_ignore_ascii_case("+draft/react")
+                            || t.0.eq_ignore_ascii_case("+draft/unreact")
+                    }) && let Some(emoji_name) =
+                        react_tag.1.as_ref().and_then(|e| emoji_to_name(e))
+                        && let Some(reply_id) = tags
+                            .iter()
+                            .find(|t| t.0.eq_ignore_ascii_case("+reply"))
+                            .and_then(|t| parse_reply_id(t.1.as_ref()?).ok())
+                    {
+                        match react_tag.0.as_str() {
+                            "+draft/react" => {
+                                self.chat_client.send_react(emoji_name, reply_id).await?;
+                            }
+                            "+draft/unreact" => {
+                                self.chat_client.send_unreact(emoji_name, reply_id).await?;
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                } else {
+                    self.irc_sink
+                        .feed(Message {
+                            tags: None,
+                            prefix: None,
+                            command: Command::Response(
+                                Response::ERR_NOSUCHNICK,
+                                vec![
+                                    self.nick.clone(),
+                                    channel.to_owned(),
+                                    "No such nick/channel".to_string(),
+                                ],
+                            ),
+                        })
+                        .await?;
+                }
+            }
             Command::JOIN(channel, _, _) => {
                 if channel == "#blanket-fort" {
                     self.irc_sink
@@ -712,7 +752,6 @@ where
                         .await?;
                 }
             }
-            Command::Raw(command, args) if command.eq_ignore_ascii_case("TAGMSG") => {}
             Command::WHO(None, _) => {
                 self.irc_sink
                     .feed(create_response(
