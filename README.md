@@ -51,3 +51,7 @@ After configuring the config file and restarting the server, you may use any IRC
 - Message deletions
 - Graceful error handling
 - Approximately 80% of the required IRC server spec (none of the clients I've tested seem to mind, though)
+
+### Bugs
+
+- discourse usernames can contain dots but irc nicks can't should probably fix that
