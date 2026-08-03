@@ -263,11 +263,30 @@ impl Stream for MessageBus<'_> {
                         channel,
                         ..
                     }) = &message
-                        && let Some(entry) = self.inner.channels.get_mut(channel)
+                        && let Some(entry) = this.inner.channels.get_mut(channel)
                     {
                         *entry = *message_id;
                     }
-                    return Poll::Ready(Some(message.wrap_err("Getting MessageBus message")));
+
+                    match message {
+                        Err(e) => {
+                            let error = e.downcast::<reqwest::Error>();
+                            if let Ok(ref e) = error
+                                && e.is_decode()
+                            {
+                                eprintln!("error decoding body!, retrying messagebus request");
+                            } else {
+                                let e: color_eyre::Report = match error {
+                                    Ok(e) => e.into(),
+                                    Err(e) => e.into(),
+                                };
+                                return Poll::Ready(Some(
+                                    Err(e).wrap_err("Getting MessageBus message"),
+                                ));
+                            }
+                        }
+                        Ok(m) => return Poll::Ready(Some(Ok(m))),
+                    }
                 }
 
                 this.inner.sequence_number += 1;
