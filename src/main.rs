@@ -1066,16 +1066,17 @@ async fn main() -> Result<()> {
 
     let config: ServerConfig = confy::load("ghffdsa", Some("config"))?;
 
+    let chat_client =
+        ChatClient::new(&config.base_url, config.username.clone(), &config.password).await?;
     let listener = TcpListener::bind("0.0.0.0:6667").await?;
 
     loop {
         let (socket, address) = listener.accept().await?;
         println!("Received connection from {address}");
-        let chat_client =
-            ChatClient::new(&config.base_url, config.username.clone(), &config.password).await?;
         let (irc_sink, irc_stream) = IrcCodec::new("UTF-8")?.framed(socket).split();
         let event_stream = create_event_stream(chat_client.clone(), irc_stream);
 
+        let chat_client = chat_client.clone();
         task::spawn_local(async move {
             let conn = Connection::new(irc_sink, event_stream, chat_client).await;
             if let Err(e) = conn
