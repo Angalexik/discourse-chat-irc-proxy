@@ -221,7 +221,7 @@ pub struct MessageBus<'a> {
 }
 
 impl MessageBus<'_> {
-    pub fn new(chat_client: ChatClient, channels: &[&str]) -> Self {
+    pub fn new(chat_client: DiscourseChatClient, channels: &[&str]) -> Self {
         let client = chat_client.client;
         let headers = chat_client.headers;
         let base_url = chat_client.base_url;
@@ -334,14 +334,24 @@ impl From<DiscourseMessage> for ChatMessage {
 }
 
 #[derive(Clone)]
-pub struct ChatClient {
+pub struct DiscourseChatClient {
     client: Client,
     headers: HeaderMap,
     base_url: Url,
     pub username: String,
 }
 
-impl ChatClient {
+pub trait ChatClient {
+    fn get_username(&self) -> &str;
+
+    async fn message_backlog(&self) -> Result<Vec<ChatMessage>>;
+    async fn send_message(&self, text: &str, replying_to: Option<i64>) -> Result<i64>;
+    async fn send_react(&self, emoji_name: &str, replying_to: i64) -> Result<()>;
+    async fn send_unreact(&self, emoji_name: &str, replying_to: i64) -> Result<()>;
+    async fn list_users(&self) -> Result<Vec<DiscourseUser>>;
+}
+
+impl DiscourseChatClient {
     pub async fn new(base_url: impl IntoUrl, login: String, password: &str) -> Result<Self> {
         let base_url = base_url.into_url()?;
 
@@ -383,61 +393,6 @@ impl ChatClient {
         })
     }
 
-    pub async fn message_backlog(&self) -> Result<Vec<ChatMessage>> {
-        #[derive(Deserialize)]
-        struct ApiResponse {
-            messages: Vec<DiscourseMessage>,
-        }
-
-        let messages = self
-            .client
-            .get(self.base_url.join("/chat/api/channels/4/messages")?)
-            .headers(self.headers.clone())
-            .query(&[("page_size", 50)])
-            .send()
-            .await?
-            .json::<ApiResponse>()
-            .await?
-            .messages;
-
-        Ok(messages.iter().map(|m| m.into()).collect())
-    }
-
-    pub async fn send_message(&self, text: &str, replying_to: Option<i64>) -> Result<i64> {
-        #[derive(Deserialize)]
-        struct ApiResponse {
-            success: String,
-            message_id: i64,
-        }
-
-        let timestamp = UtcDateTime::now().format(&Iso8601::<ISO8601_CONFIG>)?;
-        let response = self
-            .client
-            .post(self.base_url.join("/chat/4")?)
-            .headers(self.headers.clone())
-            .form(&[
-                ("message", Some(text)),
-                ("staged_id", Some(&Uuid::new_v4().to_string())),
-                ("client_created_at", Some(&timestamp)),
-                (
-                    "in_reply_to_id",
-                    replying_to.map(|i| i.to_string()).as_deref(),
-                ),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<ApiResponse>()
-            .await?;
-
-        let status = response.success;
-        if status == "OK" {
-            Ok(response.message_id)
-        } else {
-            Err(eyre!("expected status `OK`, instead received `{status}`"))
-        }
-    }
-
     async fn send_react_common(
         &self,
         emoji_name: &str,
@@ -473,18 +428,75 @@ impl ChatClient {
             Err(eyre!("expected status `OK`, instead received `{status}`"))
         }
     }
+}
 
-    pub async fn send_react(&self, emoji_name: &str, replying_to: i64) -> Result<()> {
+impl ChatClient for DiscourseChatClient {
+    async fn message_backlog(&self) -> Result<Vec<ChatMessage>> {
+        #[derive(Deserialize)]
+        struct ApiResponse {
+            messages: Vec<DiscourseMessage>,
+        }
+
+        let messages = self
+            .client
+            .get(self.base_url.join("/chat/api/channels/4/messages")?)
+            .headers(self.headers.clone())
+            .query(&[("page_size", 50)])
+            .send()
+            .await?
+            .json::<ApiResponse>()
+            .await?
+            .messages;
+
+        Ok(messages.iter().map(|m| m.into()).collect())
+    }
+
+    async fn send_message(&self, text: &str, replying_to: Option<i64>) -> Result<i64> {
+        #[derive(Deserialize)]
+        struct ApiResponse {
+            success: String,
+            message_id: i64,
+        }
+
+        let timestamp = UtcDateTime::now().format(&Iso8601::<ISO8601_CONFIG>)?;
+        let response = self
+            .client
+            .post(self.base_url.join("/chat/4")?)
+            .headers(self.headers.clone())
+            .form(&[
+                ("message", Some(text)),
+                ("staged_id", Some(&Uuid::new_v4().to_string())),
+                ("client_created_at", Some(&timestamp)),
+                (
+                    "in_reply_to_id",
+                    replying_to.map(|i| i.to_string()).as_deref(),
+                ),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ApiResponse>()
+            .await?;
+
+        let status = response.success;
+        if status == "OK" {
+            Ok(response.message_id)
+        } else {
+            Err(eyre!("expected status `OK`, instead received `{status}`"))
+        }
+    }
+
+    async fn send_react(&self, emoji_name: &str, replying_to: i64) -> Result<()> {
         self.send_react_common(emoji_name, replying_to, AddOrRemove::Add)
             .await
     }
 
-    pub async fn send_unreact(&self, emoji_name: &str, replying_to: i64) -> Result<()> {
+    async fn send_unreact(&self, emoji_name: &str, replying_to: i64) -> Result<()> {
         self.send_react_common(emoji_name, replying_to, AddOrRemove::Remove)
             .await
     }
 
-    pub async fn list_users(&self) -> Result<Vec<DiscourseUser>> {
+    async fn list_users(&self) -> Result<Vec<DiscourseUser>> {
         #[derive(Deserialize)]
         struct GlobalPresenceChannelState {
             users: Vec<DiscourseUser>,
@@ -509,13 +521,17 @@ impl ChatClient {
             .into_iter()
             .collect())
     }
+
+    fn get_username(&self) -> &str {
+        &self.username
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::MessageBusMessage;
 
-    use super::{ChatClient, MessageBus};
+    use super::{ChatClient, DiscourseChatClient, MessageBus};
 
     use futures::StreamExt;
     use httpmock::{Mock, prelude::*};
@@ -572,7 +588,7 @@ mod tests {
 
         let url: Url = server.base_url().as_str().try_into().unwrap();
 
-        ChatClient::new(url.clone(), "test_user".to_string(), "test_password")
+        DiscourseChatClient::new(url.clone(), "test_user".to_string(), "test_password")
             .await
             .unwrap();
     }
@@ -601,7 +617,7 @@ mod tests {
         });
 
         let url: Url = server.base_url().as_str().try_into().unwrap();
-        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
+        let chat_client = DiscourseChatClient::new(url, "test_user".to_string(), "test_password")
             .await
             .unwrap();
         let mut message_bus = MessageBus::new(chat_client, &["/refresh_client"]);
@@ -635,7 +651,7 @@ mod tests {
         });
 
         let url: Url = server.base_url().as_str().try_into().unwrap();
-        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
+        let chat_client = DiscourseChatClient::new(url, "test_user".to_string(), "test_password")
             .await
             .unwrap();
 
@@ -671,7 +687,7 @@ mod tests {
         });
 
         let url: Url = server.base_url().as_str().try_into().unwrap();
-        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
+        let chat_client = DiscourseChatClient::new(url, "test_user".to_string(), "test_password")
             .await
             .unwrap();
 
@@ -716,7 +732,7 @@ mod tests {
         });
 
         let url: Url = server.base_url().as_str().try_into().unwrap();
-        let chat_client = ChatClient::new(url, "test_user".to_string(), "test_password")
+        let chat_client = DiscourseChatClient::new(url, "test_user".to_string(), "test_password")
             .await
             .unwrap();
 

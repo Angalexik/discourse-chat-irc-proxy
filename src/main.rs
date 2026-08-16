@@ -32,7 +32,8 @@ use uuid::Uuid;
 use crate::{
     discourse_chat::{
         AddOrRemove::{Add, Remove},
-        ChatClient, ChatMessage, DiscourseUser, MessageBus, MessageBusChat, MessageBusMessage,
+        ChatClient, ChatMessage, DiscourseChatClient, DiscourseUser, MessageBus, MessageBusChat,
+        MessageBusMessage,
     },
     emoji::{emoji_to_name, name_to_emoji},
 };
@@ -187,26 +188,27 @@ impl ConnectionState {
     }
 }
 
-struct Connection<Si, St> {
+struct Connection<Si, St, Ch> {
     nick: String,
     irc_sink: Si,
     event_stream: St,
-    chat_client: ChatClient,
+    chat_client: Ch,
     users: HashMap<i64, String>,
     users_typing: HashMap<i64, String>,
     connection_state: ConnectionState,
     capabilities: HashSet<Capability>,
 }
 
-impl<Si, St> Connection<Si, St>
+impl<Si, St, Ch> Connection<Si, St, Ch>
 where
     Si: Sink<Message> + Unpin,
     Si::Error: core::error::Error + Sync + Send + 'static,
     St: Stream<Item = Result<Event>> + Unpin,
+    Ch: ChatClient,
 {
-    async fn new(irc_sink: Si, event_stream: St, chat_client: ChatClient) -> Self {
+    async fn new(irc_sink: Si, event_stream: St, chat_client: Ch) -> Self {
         Self {
-            nick: chat_client.username.clone(),
+            nick: chat_client.get_username().to_owned(),
             irc_sink,
             event_stream,
             chat_client,
@@ -1035,7 +1037,7 @@ fn parse_reply_id(content: &str) -> Result<i64> {
 }
 
 fn create_event_stream(
-    chat_client: ChatClient,
+    chat_client: DiscourseChatClient,
     irc_stream: impl Stream<Item = Result<Message, ProtocolError>> + 'static,
 ) -> impl Stream<Item = Result<Event>> {
     let mut map = StreamMap::new();
@@ -1067,7 +1069,8 @@ async fn main() -> Result<()> {
     let config: ServerConfig = confy::load("ghffdsa", Some("config"))?;
 
     let chat_client =
-        ChatClient::new(&config.base_url, config.username.clone(), &config.password).await?;
+        DiscourseChatClient::new(&config.base_url, config.username.clone(), &config.password)
+            .await?;
     let listener = TcpListener::bind("0.0.0.0:6667").await?;
 
     loop {
