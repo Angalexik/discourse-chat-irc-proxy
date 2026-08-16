@@ -928,9 +928,9 @@ where
         nick: Option<String>,
         command: CapSubCommand,
         param: Option<String>,
-        idk: Option<String>,
+        caps: Option<String>,
     ) -> Result<()> {
-        if nick.is_some() && idk.is_some() {
+        if nick.is_some() || caps.is_some() {
             return Err(eyre!("Malformed CAP command"));
         }
 
@@ -1095,7 +1095,128 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    use std::{
+        cell::{Cell, RefCell},
+        str::FromStr,
+    };
+
+    use color_eyre::eyre::{OptionExt, Result, eyre};
+    use futures::{
+        Sink, SinkExt, StreamExt,
+        channel::mpsc::{UnboundedReceiver, UnboundedSender},
+    };
+    use irc::proto as irc;
+    use strum::ParseError;
+    use time::UtcDateTime;
+
+    use crate::{
+        Capability, discourse_chat::{ChatClient, ChatMessage, DiscourseUser, MessageBusMessage},
+    };
+
     use super::parse_reply_id;
+
+    const TEST_USERNAME: &'static str = "testerman";
+
+    struct TestIrcClient {
+        rx: UnboundedReceiver<irc::Message>,
+        tx: UnboundedSender<irc::Message>,
+    }
+
+    impl TestIrcClient {
+        async fn register(&mut self) -> Result<()> {
+            self.tx
+                .send(irc::Message::new(None, "CAP", vec!["LS", "302"])?)
+                .await?;
+            let irc::Command::CAP(_, irc::CapSubCommand::LS, None, Some(caps)) = self
+                .rx
+                .next()
+                .await
+                .ok_or_eyre("There's nothing there...")?
+                .command
+            else {
+                return Err(eyre!("register error"));
+            };
+
+            let caps = caps
+                .split(" ")
+                .map(Capability::from_str)
+                .collect::<Result<Vec<_>, ParseError>>()?;
+
+            if !(caps.contains(&Capability::Batch) && caps.contains(&Capability::MessageTags)) {
+                return Err(eyre!("server is missing required capabilities"));
+            }
+
+            self.tx
+                .send(irc::Message::new(
+                    None,
+                    "CAP",
+                    vec!["REQ", "batch message-tags"],
+                )?)
+                .await?;
+
+            todo!()
+        }
+    }
+    struct MockChatClient<Si> {
+        backlog: RefCell<Vec<ChatMessage>>,
+        messagebus_sink: Si,
+        chat_message_counter: Cell<i64>,
+    }
+
+    impl<Si> MockChatClient<Si>
+    where
+        Si: Sink<MessageBusMessage>,
+    {
+        fn with_no_backlog(sink: Si) -> Self {
+            Self {
+                backlog: Default::default(),
+                messagebus_sink: sink,
+                chat_message_counter: 0.into(),
+            }
+        }
+    }
+
+    impl<Si> ChatClient for MockChatClient<Si>
+    where
+        Si: Sink<MessageBusMessage>,
+    {
+        async fn message_backlog(&self) -> Result<Vec<ChatMessage>> {
+            Ok(self.backlog.borrow().clone())
+        }
+
+        async fn send_message(&self, text: &str, replying_to: Option<i64>) -> Result<i64> {
+            let id = self.chat_message_counter.get();
+            let message = ChatMessage {
+                text: text.to_owned(),
+                sender: TEST_USERNAME.to_owned(),
+                timestamp: UtcDateTime::UNIX_EPOCH,
+                id,
+                replying_to,
+            };
+
+            self.backlog.borrow_mut().push(message.clone());
+
+            self.chat_message_counter.update(|x| x + 1);
+            Ok(id)
+        }
+
+        async fn list_users(&self) -> Result<Vec<DiscourseUser>> {
+            Ok(Vec::new())
+        }
+
+        fn get_username(&self) -> &str {
+            return TEST_USERNAME;
+        }
+
+        async fn send_react(&self, emoji_name: &str, replying_to: i64) -> Result<()> {
+            todo!()
+        }
+
+        async fn send_unreact(&self, emoji_name: &str, replying_to: i64) -> Result<()> {
+            todo!()
+        }
+    }
 
     #[test]
     fn test_parse_reply() {

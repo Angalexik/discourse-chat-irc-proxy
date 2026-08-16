@@ -307,6 +307,7 @@ impl Stream for MessageBus<'_> {
     }
 }
 
+#[derive(Clone)]
 pub struct ChatMessage {
     pub text: String,
     pub sender: String,
