@@ -51,6 +51,8 @@ struct ServerConfig {
     password: String,
     channel_number: i64,
     channel_name: String,
+    send_join_part: bool,
+    send_chat_history: bool,
 }
 
 impl Default for ServerConfig {
@@ -61,6 +63,8 @@ impl Default for ServerConfig {
             password: "hunter2".to_string(),
             channel_number: 4,
             channel_name: "#blanket-fort".to_string(),
+            send_join_part: false,
+            send_chat_history: true,
         }
     }
 }
@@ -197,6 +201,8 @@ struct Connection<Si, St, Ch> {
     users_typing: HashMap<i64, String>,
     connection_state: ConnectionState,
     capabilities: HashSet<Capability>,
+    send_join_part: bool,
+    send_chat_history: bool,
 }
 
 impl<Si, St, Ch> Connection<Si, St, Ch>
@@ -206,7 +212,13 @@ where
     St: Stream<Item = Result<Event>> + Unpin,
     Ch: ChatClient,
 {
-    async fn new(irc_sink: Si, event_stream: St, chat_client: Ch) -> Self {
+    async fn new(
+        irc_sink: Si,
+        event_stream: St,
+        chat_client: Ch,
+        send_join_part: bool,
+        send_chat_history: bool,
+    ) -> Self {
         Self {
             nick: chat_client.get_username().to_owned(),
             irc_sink,
@@ -216,6 +228,8 @@ where
             users_typing: HashMap::new(),
             connection_state: ConnectionState::Initial,
             capabilities: HashSet::new(),
+            send_join_part,
+            send_chat_history,
         }
     }
 
@@ -255,13 +269,15 @@ where
 
         self.send_names("#blanket-fort".to_string()).await?;
 
-        let backlog = self
-            .chat_client
-            .message_backlog()
-            .await
-            .wrap_err("Getting message backlog")?;
+        if self.send_chat_history {
+            let backlog = self
+                .chat_client
+                .message_backlog()
+                .await
+                .wrap_err("Getting message backlog")?;
 
-        self.send_backlog(&backlog).await?;
+            self.send_backlog(&backlog).await?;
+        }
 
         Ok(())
     }
@@ -456,11 +472,10 @@ where
                 let (entering, leaving) =
                     Self::modify_presence_and_diff(&mut self.users, message.deserialize_presence());
 
-                // TODO: Make the display of JOIN and PART messages configurable, since some clients
-                // show them in quite a distracting way
                 for username in entering {
                     if !username.eq_ignore_ascii_case(&self.nick)
                         && matches!(self.connection_state, ConnectionState::Registered(_))
+                        && self.send_join_part
                     {
                         self.irc_sink
                             .feed(Message::new(
@@ -475,6 +490,7 @@ where
                 for username in leaving {
                     if !username.eq_ignore_ascii_case(&self.nick)
                         && matches!(self.connection_state, ConnectionState::Registered(_))
+                        && self.send_join_part
                     {
                         self.irc_sink
                             .feed(Message::new(
@@ -1066,7 +1082,8 @@ async fn main() -> Result<()> {
     println!("Hello, world!");
     color_eyre::install()?;
 
-    let config: ServerConfig = confy::load("ghffdsa", Some("config"))?;
+    let config: ServerConfig =
+        confy::load("ghffdsa", Some("config")).wrap_err("Failed to read configuration file")?;
 
     let chat_client =
         DiscourseChatClient::new(&config.base_url, config.username.clone(), &config.password)
@@ -1081,7 +1098,14 @@ async fn main() -> Result<()> {
 
         let chat_client = chat_client.clone();
         task::spawn_local(async move {
-            let conn = Connection::new(irc_sink, event_stream, chat_client).await;
+            let conn = Connection::new(
+                irc_sink,
+                event_stream,
+                chat_client,
+                config.send_join_part,
+                config.send_chat_history,
+            )
+            .await;
             if let Err(e) = conn
                 .handle()
                 .await
