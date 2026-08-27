@@ -1098,6 +1098,7 @@ mod tests {
 
     use std::{
         cell::{Cell, RefCell},
+        collections::HashSet,
         str::FromStr,
     };
 
@@ -1111,7 +1112,8 @@ mod tests {
     use time::UtcDateTime;
 
     use crate::{
-        Capability, discourse_chat::{ChatClient, ChatMessage, DiscourseUser, MessageBusMessage},
+        Capability,
+        discourse_chat::{ChatClient, ChatMessage, DiscourseUser, MessageBusMessage},
     };
 
     use super::parse_reply_id;
@@ -1121,6 +1123,7 @@ mod tests {
     struct TestIrcClient {
         rx: UnboundedReceiver<irc::Message>,
         tx: UnboundedSender<irc::Message>,
+        request_caps: HashSet<Capability>,
     }
 
     impl TestIrcClient {
@@ -1143,19 +1146,56 @@ mod tests {
                 .map(Capability::from_str)
                 .collect::<Result<Vec<_>, ParseError>>()?;
 
-            if !(caps.contains(&Capability::Batch) && caps.contains(&Capability::MessageTags)) {
+            if !(self.request_caps.iter().all(|c| caps.contains(c))) {
                 return Err(eyre!("server is missing required capabilities"));
             }
 
+            if !self.request_caps.is_empty() {
+                self.tx
+                    .feed(irc::Message::new(
+                        None,
+                        "CAP",
+                        vec![
+                            "REQ",
+                            &self
+                                .request_caps
+                                .iter()
+                                .map(|c| c.into())
+                                .collect::<Vec<&str>>()
+                                .join(" "),
+                        ],
+                    )?)
+                    .await?;
+            }
+
             self.tx
-                .send(irc::Message::new(
+                .feed(irc::Message::new(None, "NICK", vec![TEST_USERNAME])?)
+                .await?;
+
+            self.tx
+                .feed(irc::Message::new(
                     None,
-                    "CAP",
-                    vec!["REQ", "batch message-tags"],
+                    "USER",
+                    vec![TEST_USERNAME, "0", "*", TEST_USERNAME],
                 )?)
                 .await?;
 
-            todo!()
+            self.tx
+                .feed(irc::Message::new(None, "CAP", vec!["END"])?)
+                .await?;
+
+            self.tx.flush().await?;
+
+            Ok(())
+        }
+
+        async fn wait(&mut self, last_message: Option<&str>) -> Result<()> {
+            while let Some(message) = self.rx.next().await {
+                if self.request_caps.contains(&Capability::Batch)
+                    && let irc::Command::BATCH(_, _, _) = message.command
+                {}
+            }
+            Ok(())
         }
     }
     struct MockChatClient<Si> {
@@ -1223,4 +1263,28 @@ mod tests {
         assert_eq!(parse_reply_id("1234").unwrap(), 1234);
         assert_eq!(parse_reply_id("4567_1").unwrap(), 4567);
     }
+
+    // #[tokio::test]
+    // async fn test_privmsg() {
+    //     let (irc_client_sink, irc_client_stream) = mpsc::unbounded();
+    //     let (events_sink, events_stream) = mpsc::unbounded();
+    //     let chat_client = MockChatClient::default();
+
+    //     let server_task = task::spawn(async move {
+    //         Connection::new(irc_client_sink, events_stream, chat_client)
+    //             .await
+    //             .handle()
+    //             .await
+    //     });
+
+    //     let client_task = task::spawn(async move {
+    //         let client = IrcClient::new(
+    //             events_sink.with(|m| async { Ok(Ok(Event::Irc(m))) }),
+    //             irc_client_stream,
+    //         );
+    //         Ok(())
+    //     });
+
+    //     let res = try_join!(server_task, client_task);
+    // }
 }
