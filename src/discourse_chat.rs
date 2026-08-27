@@ -18,6 +18,7 @@ use std::{
     task::{Poll, ready},
 };
 use strum::{EnumString, IntoStaticStr};
+use thiserror::Error;
 use time::{
     UtcDateTime,
     format_description::well_known::{Iso8601, Rfc3339},
@@ -85,27 +86,37 @@ pub struct MessageBusMessage {
     data: serde_json::Value,
 }
 
+#[derive(Error, Debug)]
+pub enum MessageBusError {
+    #[error("Ummm errr, well...")]
+    IgnoreThisErrorKthxBai,
+    #[error(transparent)]
+    Serde(#[from] serde_json::Error),
+}
+
 impl MessageBusMessage {
-    pub fn deserialize_chat(self) -> Result<MessageBusChat> {
+    pub fn deserialize_chat(self) -> Result<MessageBusChat, MessageBusError> {
         #[derive(Deserialize, Debug)]
         #[serde(tag = "type")]
         #[serde(rename_all = "lowercase")]
         enum Data {
             Sent { chat_message: DiscourseMessage },
             Reaction(DiscourseReact),
+            Processed,
         }
 
         let deserialized = serde_json::from_value::<Data>(self.data)?;
 
-        Ok(match deserialized {
-            Data::Sent { chat_message } => MessageBusChat::Message(chat_message.into()),
-            Data::Reaction(reaction) => MessageBusChat::Reaction {
+        match deserialized {
+            Data::Sent { chat_message } => Ok(MessageBusChat::Message(chat_message.into())),
+            Data::Reaction(reaction) => Ok(MessageBusChat::Reaction {
                 sender: reaction.user.username,
                 reaction_to: reaction.chat_message_id,
                 action: reaction.action,
                 emoji_name: reaction.emoji,
-            },
-        })
+            }),
+            Data::Processed => Err(MessageBusError::IgnoreThisErrorKthxBai),
+        }
     }
 
     pub fn deserialize_presence(self) -> (Vec<DiscourseUser>, Vec<i64>) {

@@ -33,7 +33,7 @@ use crate::{
     discourse_chat::{
         AddOrRemove::{Add, Remove},
         ChatClient, ChatMessage, DiscourseChatClient, DiscourseUser, MessageBus, MessageBusChat,
-        MessageBusMessage,
+        MessageBusError, MessageBusMessage,
     },
     emoji::{emoji_to_name, name_to_emoji},
 };
@@ -573,6 +573,7 @@ where
                                     .await?
                             }
                         }
+                        Err(MessageBusError::IgnoreThisErrorKthxBai) => (),
                         Err(e) => {
                             let _ = dbg!(e);
                         }
