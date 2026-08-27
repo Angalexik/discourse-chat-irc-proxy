@@ -855,6 +855,9 @@ where
             Command::CAP(nick, command, param, idk) => {
                 self.cap_command(nick, command, param, idk).await?;
             }
+
+            // Stub commands
+            // ---------------
             Command::NICK(new_nick) => {
                 self.irc_sink
                     .feed(create_response(
@@ -900,7 +903,7 @@ where
                     .feed(create_response(
                         Response::RPL_CHANNELMODEIS,
                         self.nick.clone(),
-                        vec![channel, "+b".to_string()],
+                        vec![channel, "+tb".to_string()],
                     ))
                     .await?;
             }
@@ -919,6 +922,108 @@ where
                         Response::RPL_USERHOST,
                         self.nick.clone(),
                         vec![replies],
+                    ))
+                    .await?;
+            }
+            Command::OPER(_name, _password) => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::ERR_NOOPERHOST,
+                        self.nick.clone(),
+                        vec!["No O-lines for your host".to_string()],
+                    ))
+                    .await?;
+            }
+            Command::TOPIC(channel, None) => {
+                if !channel.eq_ignore_ascii_case("#blanket-fort") {
+                    self.irc_sink
+                        .feed(create_response(
+                            Response::ERR_NOSUCHCHANNEL,
+                            self.nick.clone(),
+                            vec![channel, "No such channel".to_string()],
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+
+                self.irc_sink
+                    .feed(create_response(
+                        Response::RPL_NOTOPIC,
+                        self.nick.clone(),
+                        vec![channel, "No topic is set".to_string()],
+                    ))
+                    .await?;
+            }
+            Command::TOPIC(channel, Some(_))
+            | Command::INVITE(_, channel)
+            | Command::KICK(channel, _, _) => {
+                if !channel.eq_ignore_ascii_case("#blanket-fort") {
+                    self.irc_sink
+                        .feed(create_response(
+                            Response::ERR_NOSUCHCHANNEL,
+                            self.nick.clone(),
+                            vec![channel, "No such channel".to_string()],
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+
+                self.irc_sink
+                    .feed(create_response(
+                        Response::ERR_CHANOPRIVSNEEDED,
+                        self.nick.clone(),
+                        vec![channel, "You're not channel operator".to_string()],
+                    ))
+                    .await?;
+            }
+            Command::LIST(_, _) => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::RPL_LISTSTART,
+                        self.nick.clone(),
+                        vec!["Channel".to_string(), "Users  Name".to_string()],
+                    ))
+                    .await?;
+
+                self.irc_sink
+                    .feed(create_response(
+                        Response::RPL_LIST,
+                        self.nick.to_string(),
+                        vec![
+                            "#blanket-fort".to_string(),
+                            self.users.len().to_string(),
+                            "".to_string(),
+                        ],
+                    ))
+                    .await?;
+
+                self.irc_sink
+                    .feed(create_response(
+                        Response::RPL_LISTEND,
+                        self.nick.clone(),
+                        vec!["End of /LIST".to_string()],
+                    ))
+                    .await?;
+            }
+            Command::MOTD(_) => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::ERR_NOMOTD,
+                        self.nick.clone(),
+                        vec!["MOTD File is missing".to_string()],
+                    ))
+                    .await?;
+            }
+            Command::VERSION(_) => {
+                self.irc_sink
+                    .feed(create_response(
+                        Response::RPL_VERSION,
+                        self.nick.clone(),
+                        vec![
+                            "0.0.1".to_string(),
+                            "blanket-fort".to_string(),
+                            "".to_string(),
+                        ],
                     ))
                     .await?;
             }
