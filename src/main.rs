@@ -53,6 +53,7 @@ struct ServerConfig {
     channel_name: String,
     send_join_part: bool,
     send_chat_history: bool,
+    ircv3: bool,
 }
 
 impl Default for ServerConfig {
@@ -65,6 +66,7 @@ impl Default for ServerConfig {
             channel_name: "#blanket-fort".to_string(),
             send_join_part: false,
             send_chat_history: true,
+            ircv3: true,
         }
     }
 }
@@ -203,6 +205,7 @@ struct Connection<Si, St, Ch> {
     capabilities: HashSet<Capability>,
     send_join_part: bool,
     send_chat_history: bool,
+    respond_to_cap: bool,
 }
 
 impl<Si, St, Ch> Connection<Si, St, Ch>
@@ -218,6 +221,7 @@ where
         chat_client: Ch,
         send_join_part: bool,
         send_chat_history: bool,
+        respond_to_cap: bool,
     ) -> Self {
         Self {
             nick: chat_client.get_username().to_owned(),
@@ -230,6 +234,7 @@ where
             capabilities: HashSet::new(),
             send_join_part,
             send_chat_history,
+            respond_to_cap,
         }
     }
 
@@ -613,6 +618,18 @@ where
 
         Ok(())
     }
+    async fn send_unknown_command(&mut self, command_name: &str) -> Result<()> {
+        self.irc_sink
+            .send(create_response(
+                Response::ERR_UNKNOWNCOMMAND,
+                self.nick.clone(),
+                vec![command_name.to_string(), "Unknown command".to_string()],
+            ))
+            .await?;
+        eprintln!("Unknown method: {command_name}");
+
+        Ok(())
+    }
 
     async fn handle_initial(&mut self, irc_message: Message) -> Result<()> {
         match irc_message.command {
@@ -623,19 +640,16 @@ where
             Command::USER(..) => (),
             Command::PASS(_) => (),
             Command::CAP(nick, command, param, idk) => {
-                self.connection_state = ConnectionState::Negotiating;
-                self.cap_command(nick, command, param, idk).await?;
+                if self.respond_to_cap {
+                    self.connection_state = ConnectionState::Negotiating;
+                    self.cap_command(nick, command, param, idk).await?;
+                } else {
+                    self.send_unknown_command("CAP").await?;
+                }
             }
 
             other => {
-                self.irc_sink
-                    .feed(create_response(
-                        Response::ERR_UNKNOWNCOMMAND,
-                        self.nick.clone(),
-                        vec![other.variant_name(), "Unknown command".to_string()],
-                    ))
-                    .await?;
-                eprintln!("Unknown method: {other:#?}");
+                self.send_unknown_command(&other.variant_name()).await?;
             }
         }
 
@@ -656,14 +670,7 @@ where
             }
 
             other => {
-                self.irc_sink
-                    .feed(create_response(
-                        Response::ERR_UNKNOWNCOMMAND,
-                        self.nick.clone(),
-                        vec![other.variant_name(), "Unknown command".to_string()],
-                    ))
-                    .await?;
-                eprintln!("Unknown method: {other:#?}");
+                self.send_unknown_command(&other.variant_name()).await?;
             }
         }
 
@@ -1031,14 +1038,7 @@ where
             Command::PING(..) => unreachable!(),
             Command::QUIT(..) => unreachable!(),
             other => {
-                self.irc_sink
-                    .feed(create_response(
-                        Response::ERR_UNKNOWNCOMMAND,
-                        self.nick.clone(),
-                        vec![other.variant_name(), "Unknown command".to_string()],
-                    ))
-                    .await?;
-                eprintln!("Unknown method: {other:#?}")
+                self.send_unknown_command(&other.variant_name()).await?;
             }
         }
 
@@ -1210,6 +1210,7 @@ async fn main() -> Result<()> {
                 chat_client,
                 config.send_join_part,
                 config.send_chat_history,
+                config.ircv3,
             )
             .await;
             if let Err(e) = conn
