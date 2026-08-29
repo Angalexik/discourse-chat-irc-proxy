@@ -32,6 +32,12 @@ to *"#blanket-fort"* and *4* respectively and changing the config values will ha
 
 After configuring the config file and restarting the server, you may use any IRC client to connect to the proxy server on port 6667
 
+### Note about IRCv3
+
+IRC clients using the Java library PircBotX implement the CAP command incorrectly.
+
+In order to use these clients with the server, set `ircv3 = false` in the config file. If you use a client that implements CAP *correctly*, or a client that doesn't support IRCv3 at all, you can keep `ircv3 = true`.
+
 ## Features
 
 ### Implemented
@@ -40,10 +46,10 @@ After configuring the config file and restarting the server, you may use any IRC
 - Reading new messages as they come in
 - Sending messages
 - User list
-- Accurate timestamps for messages in the backlog
-- `JOIN` and `PART` sent to the client as users enter and exit the chatroom
-- Message replies
-- Message reactions
+- Accurate timestamps for messages in the backlog (with IRCv3)
+- Message replies (with IRCv3)
+- Message reactions (with IRCv3)
+- `JOIN` and `PART` sent to the client as users enter and exit the chatroom (disabled by default)
 
 ### Unimplemented
 
